@@ -1,0 +1,26 @@
+---
+- name: OpenShift Provision
+  hosts: localhost
+  gather_facts: false
+  pre_tasks:
+  - name: Load default main vars
+    include_vars:
+      dir: "{{ openshift_provision_config_path }}/default/vars"
+      files_matching: 'main\.(json|ya?ml)$'
+
+  - name: Load cluster main vars
+    include_vars:
+      dir: "{{ openshift_provision_config_path }}/cluster/{{ openshift_provision_cluster_name }}/vars"
+      files_matching: 'main\.(json|ya?ml)$'
+
+  - name: Load vars in hierarchy order
+    include_vars:
+      dir: "{{ vars_dir }}"
+      files_matching: '[a-z0-9].*\.(json|ya?ml)$'
+    with_items: "{{ openshift_provision_config_hierarchy[::-1] }}"
+    vars:
+      vars_dir: "{{ openshift_provision_config_path }}/{{ item }}/vars"
+    when: vars_dir is directory
+
+  roles:
+  - role: openshift-provision
