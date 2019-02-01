@@ -1,0 +1,10 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster
+  labels:
+    openshift-provision.gnuthought.com/config: "true"
+data:
+  git_uri: http://demo-sbx-okd3-controller/root/openshift-provision-demo.git
+  config_dir: config

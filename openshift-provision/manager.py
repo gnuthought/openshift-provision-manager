@@ -17,10 +17,14 @@ cluster_vars = None
 config_queue = None
 namespace = None
 provision_configs = {}
-git_base_path = os.environ.get('GIT_CHECKOUT_DIR', '/tmp/git')
-ansible_runner_base_path = os.environ.get('ANSIBLE_RUNNER_DIR', '/tmp/ansible-runner')
+git_base_path = os.environ.get('GIT_CHECKOUT_DIR', '/opt/openshift-provision/cache/git')
+ansible_runner_base_path = os.environ.get('ANSIBLE_RUNNER_DIR', '/opt/openshift-provision/cache/ansible-runner')
 default_retry_interval = os.environ.get('RETRY_INTERVAL', '10m')
 default_run_interval = os.environ.get('RUN_INTERVAL', '30m')
+git_env = {
+    "GIT_COMMITTER_NAME": "openshift-provision",
+    "GIT_COMMITTER_EMAIL": "openshift-provision@gmail.com"
+}
 kube_api = None
 logger = None
 openshift_provision_playbook = os.environ.get('OPENSHIFT_PROVISION_PLAYBOOK', '/opt/openshift-provision/openshift-provision.yaml')
@@ -32,7 +36,7 @@ class ProvisionConfigInvalidError(Exception):
     pass
 class ProvisionConfigRemovedError(Exception):
     pass
-        
+
 def time_to_sec(t):
     if sys.version_info < (3,):
         integer_types = (int, long,)
@@ -92,7 +96,7 @@ class ProvisionConfig:
         return self.config_data['git_uri']
 
     def git_branch(self):
-        return self.config_data['git_branch']
+        return self.config_data.get('git_branch', 'master')
 
     def git_config_path(self):
         path = self.git_path
@@ -101,19 +105,33 @@ class ProvisionConfig:
         return path
 
     def git_clone(self):
-        subprocess.check_call([
-            'git', 'clone', self.git_uri(),
-            '--single-branch', '--branch', self.git_branch(),
-            self.git_path
-        ])
+        subprocess.check_call(
+            [
+                'git', 'clone', self.git_uri(),
+                '--single-branch', '--branch', self.git_branch(),
+                self.git_path
+            ],
+            env = git_env,
+            stderr = sys.stderr
+        )
 
     def git_pull(self):
-        subprocess.check_call([
-            'git', 'fetch', 'origin/' + self.git_branch()
-        ], cwd=self.git_path)
-        subprocess.check_call([
-            'git', 'reset', '--hard', 'origin/' + self.git_branch()
-        ], cwd=self.git_path)
+        subprocess.check_call(
+            [
+                'git', 'fetch', 'origin', self.git_branch()
+            ],
+            cwd = self.git_path,
+            env = git_env,
+            stderr = sys.stderr
+        )
+        subprocess.check_call(
+            [
+                'git', 'reset', '--hard', 'origin/' + self.git_branch()
+            ],
+            cwd = self.git_path,
+            env = git_env,
+            stderr = sys.stderr
+        )
 
     def git_refresh(self):
         if os.path.isdir(self.git_path):
@@ -124,7 +142,7 @@ class ProvisionConfig:
     def run_openshift_provision_ansible(self):
         self.last_runtime = time.time()
         ansible_run = ansible_runner.run(
-            playbook = openshift_provision_playbook,
+            playbook = 'openshift-provision.yaml',
             private_data_dir = self.prepare_ansible_runner_dir()
         )
         logger.info("{}: {}".format(ansible_run.status, ansible_run.rc))
@@ -136,13 +154,15 @@ class ProvisionConfig:
         # FIXME - What about check mode?
         self.last_run = ansible_run
         if ansible_run.rc == 0:
-            config_queue.push(self.name, config.run_interval)
+            config_queue.push(self.name, self.run_interval)
         else:
-            config_queue.push(self.name, config.retry_interval)
+            config_queue.push(self.name, self.retry_interval)
 
     def prepare_ansible_runner_dir(self):
         # FIXME --vault-password-file support?
         # FIXME - What about check mode?
+        # FIXME - Support making service account token configurable
+        logger.debug("Preparing ansible runner for " + self.name)
         private_data_dir = "{}/{}".format(ansible_runner_base_path, self.name)
         if os.path.isdir(private_data_dir):
             shutil.rmtree(private_data_dir)
@@ -163,12 +183,14 @@ class ProvisionConfig:
                     self.git_config_path()
                 )
             )
-        #shutil.copyfile(
-        #    openshift_provision_playbook,
-        #    private_data_dir + '/project/openshift-provision.yaml')
-        #shutil.copytree(
-        #    'roles/openshift-provision',
-        #    private_data_dir + '/project/roles/openshift-provision')
+        shutil.copyfile(
+            openshift_provision_playbook,
+            private_data_dir + '/project/openshift-provision.yaml')
+        if os.path.isdir(self.git_path + '/filter_plugins'):
+            os.symlink(
+                self.git_path + '/filter_plugins',
+                private_data_dir + '/project/filter_plugins'
+            )
         return private_data_dir
 
 class ConfigQueue:
@@ -184,7 +206,7 @@ class ConfigQueue:
     def _process_delay_queue(self):
         for name, delay_until in self.delay_queue.items():
             if delay_until >= time.time():
-                self.queue.push(name)
+                self.queue.append(name)
                 del self.delay_queue[name]
     def _insert_into_delay_queue(self, name, delay):
         """Add to delay queue if not present in immediate queue"""
@@ -240,6 +262,8 @@ def init_cluster_vars():
     """
     Read cluster_vars from kube-public cluster-vars configmap.
     """
+    # FIXME - Re-read cluster vars
+    global cluster_vars
     try:
         cluster_vars = kube_api.read_namespaced_config_map(
             'cluster-vars',
@@ -279,7 +303,7 @@ def init_logging():
     """
     global logger
     logging.basicConfig(
-        format='%(asctime)-15s %(levelname)s %(threadName)s %(message)s',
+        format='%(asctime)-15s %(levelname)s %(threadName)s - %(message)s',
     )
     logger = logging.getLogger('manager')
     logger.setLevel(os.environ.get('LOGGING_LEVEL', 'INFO'))
@@ -310,6 +334,7 @@ def signal_provision_start():
     This is done by releasing the provision_start_release lock. This lock may
     already released.
     """
+    logger.debug("Signaling provision start")
     try:
         provision_start_release.release()
     except threading.ThreadError:
@@ -345,8 +370,10 @@ def provision_config_queue():
     """
     Process all pending provisioning on config queue
     """
+    logger.debug("Provisioning configurations in queue")
     config_name = config_queue.pop()
     while config_name:
+        logger.debug("Provisioning " + config_name)
         config = provision_configs.get(config_name, None)
         if config:
             provision_config(config)
@@ -368,8 +395,8 @@ def provision_trigger_loop():
     """
     while True:
         try:
-            provision_start_release.acquire(False)
-            provision_start_release.release()
+            logger.debug("Provision start release trigger")
+            signal_provision_start()
             time.sleep(10)
         except Exception as e:
             logger.exception("Error in provision_trigger_loop " + str(e))
@@ -405,6 +432,7 @@ def watch_config_maps():
 def watch_config_maps_loop():
     while True:
         try:
+            logger.debug("Starting watch for config maps")
             watch_config_maps()
         except Exception as e:
             logger.exception("Error in watch_config_maps " + str(e))
@@ -414,8 +442,12 @@ def main():
     """Main function."""
     init()
     threading.Thread(
-        name = 'provision_loop',
+        name = 'Provision',
         target = provision_loop
+    ).start()
+    threading.Thread(
+        name = 'Watch',
+        target = watch_config_maps_loop
     ).start()
     provision_trigger_loop()
 

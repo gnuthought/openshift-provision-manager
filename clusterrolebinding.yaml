@@ -1,0 +1,14 @@
+---
+apiVersion: authorization.openshift.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-admin-openshift-provision-default
+groupNames: null
+roleRef:
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: openshift-provision
+userNames:
+- system:serviceaccount:openshift-provision:default
