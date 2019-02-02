@@ -25,4 +25,6 @@ RUN easy_install pip && \
 
 COPY openshift-provision /opt/openshift-provision
 
+USER 1000
+
 CMD /opt/openshift-provision/manager.py
