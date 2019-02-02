@@ -1,6 +1,7 @@
 ---
 - name: OpenShift Provision
   hosts: localhost
+  connection: local
   gather_facts: false
   pre_tasks:
   - name: Load default main vars

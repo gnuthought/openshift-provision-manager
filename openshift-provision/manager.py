@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-import ansible_runner
 import kubernetes
 import kubernetes.client.rest
 import logging
@@ -58,8 +57,8 @@ class ProvisionConfig:
     def __init__(self, namespace, name):
         self.config_data = {}
         self.git_path = '{}/{}'.format(git_base_path, name)
-        self.last_run = None
-        self.last_runtime = 0
+        self.last_run_return = None
+        self.last_run_time = 0
         self.lock = threading.Lock()
         self.name = name
         self.namespace = namespace
@@ -140,33 +139,52 @@ class ProvisionConfig:
             self.git_clone()
 
     def run_openshift_provision_ansible(self):
-        self.last_runtime = time.time()
-        ansible_run = ansible_runner.run(
-            playbook = 'openshift-provision.yaml',
-            private_data_dir = self.prepare_ansible_runner_dir()
+        self.last_run_time = time.time()
+        ansible_dir = self.prepare_ansible_runner_dir()
+        ansible_cmd = [
+            "ansible-playbook",
+            "--extra-vars=@{}/env/extravars".format(ansible_dir),
+            "openshift-provision.yaml"
+        ]
+        # FIXME --vault-password-file support?
+        # FIXME - support check mode?
+        ansible_run = subprocess.Popen(
+            ansible_cmd,
+            cwd = ansible_dir + '/project',
+            stderr = subprocess.STDOUT,
+            stdout = subprocess.PIPE
         )
-        logger.info("{}: {}".format(ansible_run.status, ansible_run.rc))
-        # successful: 0
-        for each_host_event in ansible_run.events:
-            logger.info(each_host_event['event'])
-        logger.info("Final status:")
-        logger.info(ansible_run.stats)
-        # FIXME - What about check mode?
-        self.last_run = ansible_run
-        if ansible_run.rc == 0:
+        changed = None
+        while True:
+            output = ansible_run.stdout.readline()
+            if output == '' and ansible_run.poll() is not None:
+                break
+            if output:
+                logger.info(output.strip())
+                m = re.match(
+                    r'^localhost +: +ok=(\d+) +changed=(\d+)' \
+                    r' +unreachable=(\d+) +failed=(\d+)',
+                    output
+                )
+                if m:
+                    changed = int(m.group(2))
+        logger.info("Return code {} changed {}".format(
+            ansible_run.returncode,
+            changed
+        ))
+        self.last_run_return = ansible_run.returncode
+        if ansible_run.returncode == 0:
             config_queue.push(self.name, self.run_interval)
         else:
             config_queue.push(self.name, self.retry_interval)
 
     def prepare_ansible_runner_dir(self):
-        # FIXME --vault-password-file support?
-        # FIXME - What about check mode?
         # FIXME - Support making service account token configurable
         logger.debug("Preparing ansible runner for " + self.name)
         private_data_dir = "{}/{}".format(ansible_runner_base_path, self.name)
         if os.path.isdir(private_data_dir):
             shutil.rmtree(private_data_dir)
-        for subdir in ('env', 'project/roles'):
+        for subdir in ('env', 'project'):
             os.makedirs(private_data_dir + '/' + subdir)
         with open(private_data_dir + '/env/extravars', 'w') as fh:
             fh.write(
@@ -205,18 +223,24 @@ class ConfigQueue:
         self.lock = threading.RLock()
     def _process_delay_queue(self):
         for name, delay_until in self.delay_queue.items():
-            if delay_until >= time.time():
+            if delay_until <= time.time():
+                logger.debug("Moving {} from delay queue".format(name))
                 self.queue.append(name)
                 del self.delay_queue[name]
     def _insert_into_delay_queue(self, name, delay):
         """Add to delay queue if not present in immediate queue"""
-        if name in self.queue:
+        if name in self.queue or name in self.delay_queue:
+            logger.debug("Not delay queueing {}, already queued".format(self.name))
             return
+        logger.debug("Inserting {} into delay queue".format(name))
         self.delay_queue[name] = time.time() + time_to_sec(delay)
     def _insert_into_queue(self, name):
         """Add to immediate queue if not present"""
         self._remove_from_delay_queue(name)
-        if name not in self.queue:
+        if name in self.queue:
+            logger.debug("Not queueing {}, already queued".format(name))
+        else:
+            logger.debug("Inserting {} into queue".format(name))
             self.queue.insert(0, name)
     def _remove_from_delay_queue(self, name):
         """Remove config from delay queue if present"""
@@ -233,6 +257,7 @@ class ConfigQueue:
         else:
             self._insert_into_queue(name)
         self.lock.release()
+        signal_provision_start()
     def pop(self):
         name = None
         self.lock.acquire()
@@ -370,10 +395,10 @@ def provision_config_queue():
     """
     Process all pending provisioning on config queue
     """
-    logger.debug("Provisioning configurations in queue")
+    logger.debug("Processing queue")
     config_name = config_queue.pop()
     while config_name:
-        logger.debug("Provisioning " + config_name)
+        logger.info("Provisioning " + config_name)
         config = provision_configs.get(config_name, None)
         if config:
             provision_config(config)
