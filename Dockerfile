@@ -13,13 +13,15 @@ RUN yum install -y \
       python-setuptools && \
     yum install -y \
       origin-clients && \
-    yum clean all
+    yum clean all && \
+    useradd -u 1000 manager
 
 RUN easy_install pip && \
     pip install --ignore-installed \
       ansible \
-      ansible-runner \
-      kubernetes && \
+      flask \
+      kubernetes \
+      prometheus_client && \
     git clone --branch=master --single-branch \
       ${OPENSHIFT_PROVISION_REPO} /etc/ansible/roles/openshift-provision
 

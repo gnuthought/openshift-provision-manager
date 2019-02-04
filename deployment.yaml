@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
       - name: manager
-        image: docker-registry.default.svc:5000/openshift-provision/openshift-provision-manager:latest
+        image: docker-registry.default.svc:5000/openshift/openshift-provision-manager:latest
         imagePullPolicy: Always
         #livenessProbe:
         #readinessProbe:

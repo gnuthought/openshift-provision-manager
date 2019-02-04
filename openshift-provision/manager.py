@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 
+import flask
+import gevent.pywsgi
 import kubernetes
 import kubernetes.client.rest
 import logging
 import os
+import prometheus_client
 import re
 import shutil
 import subprocess
@@ -11,6 +14,20 @@ import sys
 import threading
 import time
 import yaml
+
+api = flask.Flask('rest')
+
+stat_config_state = prometheus_client.Enum(
+    'config_state',
+    'Configuration state',
+    ['name'],
+    states=['new','provisioned','changed','failed','removed']
+)
+stat_webhook_call_count = prometheus_client.Counter(
+    'webhook_call_count',
+    'Number of webhook calls',
+    ['name']
+)
 
 cluster_vars = None
 config_queue = None
@@ -35,6 +52,9 @@ class ProvisionConfigInvalidError(Exception):
     pass
 class ProvisionConfigRemovedError(Exception):
     pass
+
+def is_truthy(s):
+    return s in ['yes', 'Yes', 'true', 'True']
 
 def time_to_sec(t):
     if sys.version_info < (3,):
@@ -62,6 +82,7 @@ class ProvisionConfig:
         self.lock = threading.Lock()
         self.name = name
         self.namespace = namespace
+        self.next_time_no_check_mode = False
         self.pod_name = None
         self.retry_interval = default_retry_interval
         self.run_interval = default_run_interval
@@ -90,6 +111,15 @@ class ProvisionConfig:
                 raise ProvisionConfigInvalidError(
                     'Missing required field ' + reqfield
                 )
+
+    def check_mode(self):
+        if self.next_time_no_check_mode:
+            self.next_time_no_check_mode = False
+            return False
+        return is_truthy(self.config_data.get('check_mode','no'))
+
+    def set_next_time_no_check_mode(self):
+        self.next_time_no_check_mode = True
 
     def git_uri(self):
         return self.config_data['git_uri']
@@ -146,8 +176,10 @@ class ProvisionConfig:
             "--extra-vars=@{}/env/extravars".format(ansible_dir),
             "openshift-provision.yaml"
         ]
+        check_mode = self.check_mode()
+        if check_mode:
+            ansible_cmd.append('--check')
         # FIXME --vault-password-file support?
-        # FIXME - support check mode?
         ansible_run = subprocess.Popen(
             ansible_cmd,
             cwd = ansible_dir + '/project',
@@ -159,8 +191,9 @@ class ProvisionConfig:
             output = ansible_run.stdout.readline()
             if output == '' and ansible_run.poll() is not None:
                 break
+            output = re.sub(r' *\**\n$', '', output)
             if output:
-                logger.info(output.strip())
+                logger.info(output)
                 m = re.match(
                     r'^localhost +: +ok=(\d+) +changed=(\d+)' \
                     r' +unreachable=(\d+) +failed=(\d+)',
@@ -174,8 +207,12 @@ class ProvisionConfig:
         ))
         self.last_run_return = ansible_run.returncode
         if ansible_run.returncode == 0:
+            stat_config_state.labels(self.name).state(
+                'changed' if changed and check_mode else 'provisioned'
+            )
             config_queue.push(self.name, self.run_interval)
         else:
+            stat_config_state.labels(self.name).state('failed')
             config_queue.push(self.name, self.retry_interval)
 
     def prepare_ansible_runner_dir(self):
@@ -427,17 +464,19 @@ def provision_trigger_loop():
             logger.exception("Error in provision_trigger_loop " + str(e))
             time.sleep(60)
 
-def update_config(name):
+def set_config(name):
     if name not in provision_configs:
         provision_configs[name] = ProvisionConfig(
             namespace,
             name
         )
+        stat_config_state.labels(name).state('new')
     config_queue.push(name)
 
 def remove_config(name):
     config_queue.remove(name)
     if name in provision_configs:
+        stat_config_state.labels(name).state('removed')
         del provision_configs[name]
 
 def watch_config_maps():
@@ -452,7 +491,7 @@ def watch_config_maps():
             if config_map.metadata.deletion_timestamp:
                 remove_config(config_map.metadata.name)
             else:
-                update_config(config_map.metadata.name)
+                set_config(config_map.metadata.name)
 
 def watch_config_maps_loop():
     while True:
@@ -462,6 +501,37 @@ def watch_config_maps_loop():
         except Exception as e:
             logger.exception("Error in watch_config_maps " + str(e))
             time.sleep(60)
+
+@api.route('/provision/<string:name>/<string:key>', methods=['POST'])
+def api_provision(name, key):
+    logger.info("Webhook invoked for {}".format(name))
+    if name not in provision_configs:
+        logger.warn("Webhook {} not found".format(name))
+        flask.abort(404)
+        return
+    config = provision_configs[name]
+    if key != config.get('webhook_key',None):
+        logger.warn("Invalid webhook key for {}".format(name))
+        flask.abort(403)
+        return
+    stat_api_provision_call_count.labels(name).inc()
+    config.set_next_no_check_mode()
+    config_queue.push(name)
+
+@api.route('/queue/<string:name>/<string:key>', methods=['POST'])
+def api_queue(name, key):
+    logger.info("Webhook invoked for {}".format(name))
+    if name not in provision_configs:
+        logger.warn("Webhook {} not found".format(name))
+        flask.abort(404)
+        return
+    config = provision_configs[name]
+    if key != config.get('webhook_key',None):
+        logger.warn("Invalid webhook key for {}".format(name))
+        flask.abort(403)
+        return
+    stat_api_queue_call_count.labels(name).inc()
+    config_queue.push(name)
 
 def main():
     """Main function."""
@@ -474,7 +544,13 @@ def main():
         name = 'Watch',
         target = watch_config_maps_loop
     ).start()
-    provision_trigger_loop()
+    threading.Thread(
+        name = 'Trigger',
+        target = provision_trigger_loop
+    ).start()
+    prometheus_client.start_http_server(8000)
+    http_server  = gevent.pywsgi.WSGIServer(('', 5000), api)
+    http_server.serve_forever()
 
 if __name__ == '__main__':
     main()
