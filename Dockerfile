@@ -20,6 +20,7 @@ RUN easy_install pip && \
     pip install --ignore-installed \
       ansible \
       flask \
+      gevent \
       kubernetes \
       prometheus_client && \
     git clone --branch=master --single-branch \

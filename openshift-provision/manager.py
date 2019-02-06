@@ -170,55 +170,17 @@ class ProvisionConfig:
 
     def run_openshift_provision_ansible(self):
         self.last_run_time = time.time()
-        ansible_dir = self.prepare_ansible_runner_dir()
-        ansible_cmd = [
-            "ansible-playbook",
-            "--extra-vars=@{}/env/extravars".format(ansible_dir),
-            "openshift-provision.yaml"
-        ]
         check_mode = self.check_mode()
-        if check_mode:
-            ansible_cmd.append('--check')
-        # FIXME --vault-password-file support?
-        ansible_run = subprocess.Popen(
-            ansible_cmd,
-            cwd = ansible_dir + '/project',
-            stderr = subprocess.STDOUT,
-            stdout = subprocess.PIPE
-        )
-        changed = None
-        while True:
-            output = ansible_run.stdout.readline()
-            if output == '' and ansible_run.poll() is not None:
-                break
-            output = re.sub(r' *\**\n$', '', output)
-            if output:
-                logger.info(output)
-                m = re.match(
-                    r'^localhost +: +ok=(\d+) +changed=(\d+)' \
-                    r' +unreachable=(\d+) +failed=(\d+)',
-                    output
-                )
-                if m:
-                    changed = int(m.group(2))
-        logger.info("Return code {} changed {}".format(
-            ansible_run.returncode,
-            changed
-        ))
-        self.last_run_return = ansible_run.returncode
-        if ansible_run.returncode == 0:
-            stat_config_state.labels(self.name).state(
-                'changed' if changed and check_mode else 'provisioned'
-            )
-            config_queue.push(self.name, self.run_interval)
-        else:
-            stat_config_state.labels(self.name).state('failed')
-            config_queue.push(self.name, self.retry_interval)
+        ansible_dir = self.prepare_ansible_runner_dir()
+        ansible_run = self.do_ansible_run(ansible_dir, check_mode)
+        self.record_run_result(ansible_run, ansible_dir)
+        self.queue_next_run(ansible_run)
 
     def prepare_ansible_runner_dir(self):
         # FIXME - Support making service account token configurable
         logger.debug("Preparing ansible runner for " + self.name)
         private_data_dir = "{}/{}".format(ansible_runner_base_path, self.name)
+        change_record = private_data_dir + "/change-record.yaml"
         if os.path.isdir(private_data_dir):
             shutil.rmtree(private_data_dir)
         for subdir in ('env', 'project'):
@@ -228,12 +190,14 @@ class ProvisionConfig:
                 "openshift_connection_certificate_authority: {}\n"
                 "openshift_connection_server: {}\n"
                 "openshift_connection_token: {}\n"
+                "openshift_provision_change_record: {}\n"
                 "openshift_provision_cluster_name: {}\n"
                 "openshift_provision_config_path: {}\n"
                 .format(
                     "/run/secrets/kubernetes.io/serviceaccount/ca.crt",
                     "https://openshift.default.svc",
                     serviceaccount_token,
+                    change_record,
                     cluster_vars['cluster_name'],
                     self.git_config_path()
                 )
@@ -247,6 +211,96 @@ class ProvisionConfig:
                 private_data_dir + '/project/filter_plugins'
             )
         return private_data_dir
+
+    def do_ansible_run(self, ansible_dir, check_mode):
+        ansible_cmd = [
+            "ansible-playbook",
+            "--extra-vars=@{}/env/extravars".format(ansible_dir),
+            "openshift-provision.yaml"
+        ]
+        if check_mode:
+            ansible_cmd.append('--check')
+        # FIXME --vault-password-file support?
+        ansible_run = subprocess.Popen(
+            ansible_cmd,
+            cwd = ansible_dir + '/project',
+            stderr = subprocess.STDOUT,
+            stdout = subprocess.PIPE
+        )
+        while True:
+            output = ansible_run.stdout.readline()
+            if output == '' and ansible_run.poll() is not None:
+                break
+            output = re.sub(r' *\**\n$', '', output)
+            if output:
+                logger.info(output)
+        logger.info("Return code {}".format(ansible_run.returncode))
+        return ansible_run
+
+    def record_run_result(self, ansible_run, ansible_dir):
+        self.last_run_return = ansible_run.returncode
+        change_record = ansible_dir + "/change-record.yaml"
+        change_yaml = None
+        if os.path.isfile(change_record):
+            with open(change_record) as f:
+               change_yaml = f.read()
+
+        if ansible_run.returncode != 0:
+            state = 'failed'
+        elif change_yaml:
+            state = 'changed'
+        else:
+            state = 'provisioned'
+
+        stat_config_state.labels(self.name).state(state)
+        self.update_status_config_map(
+            change_yaml = change_yaml,
+            state = state
+        )
+
+    def get_status_config_map(self):
+        status_config_map = None
+        try:
+            status_config_map = kube_api.read_namespaced_config_map(
+                self.name + '-status',
+                self.namespace
+            ).data
+        except kubernetes.client.rest.ApiException as e:
+            if e.status != 404:
+                raise
+        return status_config_map
+
+    def update_status_config_map(self, change_yaml, state):
+        status_config_map = self.get_status_config_map()
+        status_data = {
+            "changes": change_yaml,
+            "state": state
+        }
+        if status_config_map:
+            kube_api.patch_namespaced_config_map(
+                self.name + '-status',
+                self.namespace,
+                { "data": status_data }
+            )
+        else:
+            kube_api.create_namespaced_config_map(
+                self.namespace,
+                kubernetes.client.V1ConfigMap(
+                    metadata = kubernetes.client.V1ObjectMeta(
+                        name = self.name + '-status',
+                        labels = {
+                            "openshift-provision.gnuthought.com/status": "true"
+                        }
+                    ),
+                    data = status_data
+                )
+            )
+
+    def queue_next_run(self, ansible_run):
+        if ansible_run.returncode == 0:
+            config_queue.push(self.name, self.run_interval)
+        else:
+            config_queue.push(self.name, self.retry_interval)
 
 class ConfigQueue:
     """
