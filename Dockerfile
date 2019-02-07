@@ -14,7 +14,7 @@ RUN yum install -y \
     yum install -y \
       origin-clients && \
     yum clean all && \
-    useradd -u 1000 manager
+    useradd -u 1000 ansible
 
 RUN easy_install pip && \
     pip install --ignore-installed \
@@ -27,7 +27,5 @@ RUN easy_install pip && \
       ${OPENSHIFT_PROVISION_REPO} /etc/ansible/roles/openshift-provision
 
 COPY openshift-provision /opt/openshift-provision
-
-USER 1000
 
 CMD /opt/openshift-provision/manager.py

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import base64
 import flask
 import gevent.pywsgi
 import kubernetes
@@ -46,7 +47,7 @@ logger = None
 openshift_provision_playbook = os.environ.get('OPENSHIFT_PROVISION_PLAYBOOK', '/opt/openshift-provision/openshift-provision.yaml')
 provision_config_lock = threading.RLock()
 provision_start_release = threading.Lock()
-serviceaccount_token = None
+service_account_token = None
 
 class ProvisionConfigInvalidError(Exception):
     pass
@@ -72,6 +73,10 @@ def time_to_sec(t):
         return 60 * int(m.group(1))
     else:
         return int(m.group(1))
+
+def run_as_ansible():
+    os.setgid(1000)
+    os.setuid(1000)
 
 class ProvisionConfig:
     def __init__(self, namespace, name):
@@ -120,6 +125,25 @@ class ProvisionConfig:
 
     def set_next_time_no_check_mode(self):
         self.next_time_no_check_mode = True
+
+    def service_account(self):
+        if 'service_account' in self.config_data:
+            return self.config_data['service_account']
+        return self.name
+
+    def service_account_token(self):
+        service_account_name = self.service_account()
+        service_account = kube_api.read_namespaced_service_account(
+            service_account_name,
+            namespace
+        )
+        for secret in service_account.secrets:
+            if secret.name.startswith(service_account_name + '-token-'):
+                secret = kube_api.read_namespaced_secret(
+                    secret.name,
+                    namespace
+                )
+                return base64.b64decode(secret.data['token'])
 
     def git_uri(self):
         return self.config_data['git_uri']
@@ -194,9 +218,9 @@ class ProvisionConfig:
                 "openshift_provision_cluster_name: {}\n"
                 "openshift_provision_config_path: {}\n"
                 .format(
-                    "/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                    ansible_runner_base_path + '/ca.crt',
                     "https://openshift.default.svc",
-                    serviceaccount_token,
+                    self.service_account_token(),
                     change_record,
                     cluster_vars['cluster_name'],
                     self.git_config_path()
@@ -224,6 +248,8 @@ class ProvisionConfig:
         ansible_run = subprocess.Popen(
             ansible_cmd,
             cwd = ansible_dir + '/project',
+            env = { "HOME": "/home/ansible" },
+            preexec_fn = run_as_ansible,
             stderr = subprocess.STDOUT,
             stdout = subprocess.PIPE
         )
@@ -370,7 +396,7 @@ def init():
     init_logging()
     init_namespace()
     init_queueing()
-    init_serviceaccount_token()
+    init_service_account_token()
     init_kube_api()
     init_cluster_vars()
 
@@ -399,12 +425,19 @@ def init_dirs():
     ]:
         if not os.path.isdir(path):
             os.makedirs(path)
+    # Make cluster ca.crt available to ansible runs
+    shutil.copyfile(
+        '/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+        ansible_runner_base_path + '/ca.crt'
+    )
+    # Protect secrets from ansible lookups
+    os.chmod("/run/secrets", 0o700)
 
 def init_kube_api():
     """Set kube_api global to communicate with the local kubernetes cluster."""
     global kube_api
     kube_config = kubernetes.client.Configuration()
-    kube_config.api_key['authorization'] = serviceaccount_token
+    kube_config.api_key['authorization'] = service_account_token
     kube_config.api_key_prefix['authorization'] = 'Bearer'
     kube_config.host = os.environ['KUBERNETES_PORT'].replace('tcp://', 'https://', 1)
     kube_config.ssl_ca_cert = '/run/secrets/kubernetes.io/serviceaccount/ca.crt'
@@ -438,10 +471,10 @@ def init_queueing():
     config_queue = ConfigQueue()
     provision_start_release.acquire()
 
-def init_serviceaccount_token():
-    global serviceaccount_token
+def init_service_account_token():
+    global service_account_token
     with open('/run/secrets/kubernetes.io/serviceaccount/token') as f:
-        serviceaccount_token = f.read()
+        service_account_token = f.read()
 
 def signal_provision_start():
     """
