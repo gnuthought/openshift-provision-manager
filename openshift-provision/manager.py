@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import base64
+import datetime
 import flask
 import gevent.pywsgi
 import kubernetes
@@ -131,6 +132,17 @@ class ProvisionConfig:
             return self.config_data['service_account']
         return self.name
 
+    def webhook_key(self):
+        if 'webhook_secret' in self.config_data:
+            secret = kube_api.read_namespaced_secret(
+                self.config_data['webhook_secret'],
+                namespace
+            )
+            return base64.b64decode(secret.data['key'])
+        elif 'webhook_key' in self.config_data:
+            return self.config_data['webhook_key']
+        return None
+
     def service_account_token(self):
         service_account_name = self.service_account()
         service_account = kube_api.read_namespaced_service_account(
@@ -201,7 +213,11 @@ class ProvisionConfig:
         self.queue_next_run(ansible_run)
 
     def prepare_ansible_runner_dir(self):
-        # FIXME - Support making service account token configurable
+        """
+        Prepare directory for ansible run. Originally this was designed for use
+        with ansible-runner, but then it was fonud that ansible runner does not
+        expose a change record.
+        """
         logger.debug("Preparing ansible runner for " + self.name)
         private_data_dir = "{}/{}".format(ansible_runner_base_path, self.name)
         change_record = private_data_dir + "/change-record.yaml"
@@ -209,6 +225,17 @@ class ProvisionConfig:
             shutil.rmtree(private_data_dir)
         for subdir in ('env', 'project'):
             os.makedirs(private_data_dir + '/' + subdir)
+
+        # Initialize change record
+        with open(change_record, "w") as fh:
+            fh.write("# Ansible run for {} - {}Z".format(
+                self.name,
+                datetime.datetime.utcnow().isoformat
+            ))
+        # Make change record writable for ansible
+        os.chmod(change_record, 0o666)
+
+        # Define extravars
         with open(private_data_dir + '/env/extravars', 'w') as fh:
             fh.write(
                 "openshift_connection_certificate_authority: {}\n"
@@ -347,7 +374,7 @@ class ConfigQueue:
     def _insert_into_delay_queue(self, name, delay):
         """Add to delay queue if not present in immediate queue"""
         if name in self.queue or name in self.delay_queue:
-            logger.debug("Not delay queueing {}, already queued".format(self.name))
+            logger.debug("Not delay queueing {}, already queued".format(name))
             return
         logger.debug("Inserting {} into delay queue".format(name))
         self.delay_queue[name] = time.time() + time_to_sec(delay)
@@ -597,13 +624,14 @@ def api_provision(name, key):
         flask.abort(404)
         return
     config = provision_configs[name]
-    if key != config.get('webhook_key',None):
+    if key != config.webhook_key():
         logger.warn("Invalid webhook key for {}".format(name))
         flask.abort(403)
         return
-    stat_api_provision_call_count.labels(name).inc()
-    config.set_next_no_check_mode()
+    stat_webhook_call_count.labels(name).inc()
+    config.set_next_time_no_check_mode()
     config_queue.push(name)
+    return flask.jsonify({'status': 'queued'})
 
 @api.route('/queue/<string:name>/<string:key>', methods=['POST'])
 def api_queue(name, key):
@@ -613,12 +641,13 @@ def api_queue(name, key):
         flask.abort(404)
         return
     config = provision_configs[name]
-    if key != config.get('webhook_key',None):
+    if key != config.webhook_key():
         logger.warn("Invalid webhook key for {}".format(name))
         flask.abort(403)
         return
-    stat_api_queue_call_count.labels(name).inc()
+    stat_webhook_call_count.labels(name).inc()
     config_queue.push(name)
+    return flask.jsonify({'status': 'queued'})
 
 def main():
     """Main function."""
