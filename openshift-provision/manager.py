@@ -230,9 +230,9 @@ class ProvisionConfig:
 
         # Initialize change record
         with open(change_record, "w") as fh:
-            fh.write("# Ansible run for {} - {}Z".format(
+            fh.write("# Ansible run for {} - {}Z\n".format(
                 self.name,
-                datetime.datetime.utcnow().isoformat
+                datetime.datetime.utcnow().isoformat()
             ))
         # Make change record writable for ansible
         os.chmod(change_record, 0o666)
@@ -302,7 +302,9 @@ class ProvisionConfig:
 
         if ansible_run.returncode != 0:
             state = 'failed'
-        elif change_yaml:
+        elif change_yaml \
+        and '---' in change_yaml:
+            # Changed if there are change records in the yaml document
             state = 'changed'
         else:
             state = 'provisioned'
