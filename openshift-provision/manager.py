@@ -170,6 +170,7 @@ class ProvisionConfig:
         return path
 
     def git_clone(self):
+        logger.info("Performing git clone for " + self.name)
         subprocess.check_call(
             [
                 'git', 'clone', self.git_uri(),
@@ -181,9 +182,10 @@ class ProvisionConfig:
         )
 
     def git_pull(self):
+        logger.info("Pulling git updates for " + self.name)
         subprocess.check_call(
             [
-                'git', 'fetch', 'origin', self.git_branch()
+                'git', 'fetch', '--force', 'origin'
             ],
             cwd = self.git_path,
             env = git_env,
