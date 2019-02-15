@@ -21,6 +21,8 @@ objects:
   kind: Project
   metadata:
     name: ${OPENSHIFT_PROVISION_NAMESPACE}
+    annotations:
+      openshift-provision/action: create
   spec:
     finalizers:
     - kubernetes
