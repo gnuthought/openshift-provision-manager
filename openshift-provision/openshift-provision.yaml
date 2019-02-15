@@ -17,7 +17,7 @@
     include_vars:
       dir: "{{ item }}"
       files_matching: 'main\.(json|ya?ml)$'
-    with_items: "{{ openshift_provision_config_path.split(':')[::-1] }}"
+    with_items: "{{ openshift_provision_config_path.split()[::-1] }}"
     when: item is directory
 
   - name: Load vars in openshift_provision_config_hierarchy

@@ -78,6 +78,41 @@ objects:
         - emptyDir: {}
           name: cache
 
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${MANAGER_SERVICE_NAME}
+    namespace: ${OPENSHIFT_PROVISION_NAMESPACE}
+  spec:
+    ports:
+    - name: api
+      port: 5000
+      protocol: TCP
+      targetPort: 5000
+    - name: metrics
+      port: 8000
+      protocol: TCP
+      targetPort: 8000
+    selector:
+      component: ${MANAGER_DEPLOYMENT_NAME}
+    sessionAffinity: None
+    type: ClusterIP
+
+- apiVersion: v1
+  kind: Route
+  metadata:
+    name: ${MANAGER_SERVICE_NAME}
+  spec:
+    port:
+      targetPort: api
+    tls:
+      termination: edge
+    to:
+      kind: Service
+      name: ${MANAGER_SERVICE_NAME}
+      weight: 100
+    wildcardPolicy: None
+
 - apiVersion: image.openshift.io/v1
   kind: ImageStream
   metadata:
