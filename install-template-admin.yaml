@@ -1,0 +1,154 @@
+---
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  annotations:
+    description: openshift-provision-manager
+  name: openshift-provision-manager
+
+parameters:
+- name: OPENSHIFT_PROVISION_NAMESPACE
+  value: openshift-provision
+- name: MANAGER_DEPLOYMENT_NAME
+  value: manager
+- name: MANAGER_SERVICE_ACCOUNT
+  value: manager
+- name: MANAGER_IMAGE
+  value: docker.io/gnuthought/openshift-provision-manager:latest
+
+objects:
+- apiVersion: project.openshift.io/v1
+  kind: Project
+  metadata:
+    name: ${OPENSHIFT_PROVISION_NAMESPACE}
+  spec:
+    finalizers:
+    - kubernetes
+
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: ${MANAGER_SERVICE_ACCOUNT}
+    namespace: ${OPENSHIFT_PROVISION_NAMESPACE}
+
+- apiVersion: authorization.openshift.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: openshift-provision-manager-cluster-admin
+  roleRef:
+    name: cluster-admin
+  subjects:
+  - kind: ServiceAccount
+    name: ${MANAGER_SERVICE_ACCOUNT}
+    namespace: ${OPENSHIFT_PROVISION_NAMESPACE}
+
+- apiVersion: extensions/v1beta1
+  kind: Deployment
+  metadata:
+    labels:
+      component: openshift-provision-manager
+    name: ${MANAGER_DEPLOYMENT_NAME}
+    namespace: ${OPENSHIFT_PROVISION_NAMESPACE}
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        component: openshift-provision-manager
+    strategy:
+      type: Recreate
+    template:
+      metadata:
+        labels:
+          component: openshift-provision-manager
+      spec:
+        containers:
+        - name: manager
+          image: docker-registry.default.svc:5000/openshift/openshift-provision-manager:latest
+          imagePullPolicy: Always
+          # FIXME - Add probes
+          #livenessProbe:
+          #readinessProbe:
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /opt/openshift-provision/cache
+            name: cache
+        restartPolicy: Always
+        securityContext: {}
+        serviceAccount: default
+        serviceAccountName: default
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir: {}
+          name: cache
+
+- apiVersion: image.openshift.io/v1
+  kind: ImageStream
+  metadata:
+    annotations:
+      openshift.io/display-name: openshift-provision-manager
+    name: openshift-provision-manager
+    namespace: openshift
+  spec:
+    lookupPolicy:
+      local: false
+    tags:
+    - annotations:
+        description: openshift-provision-manager
+        openshift.io/display-name: openshift-provision-manager
+        tags: openshift-provision-manager
+      from:
+        kind: DockerImage
+        name: ${MANAGER_IMAGE}
+      importPolicy:
+        scheduled: true
+      name: latest
+      referencePolicy:
+        type: Local
+
+- apiVersion: authorization.openshift.io/v1
+  kind: ClusterRole
+  metadata:
+    annotations:
+      openshift.io/description: >
+        Access to manage project quotas and limit ranges. This role is meant for
+        assignment at the project level and does not include the ability to
+        manage OpenShift cluster resource quotas.
+    name: resource-manager
+  rules:
+  - apiGroups:
+    - ""
+    attributeRestrictions: null
+    resources:
+    - limitranges
+    - resourcequotas
+    verbs:
+    - create
+    - delete
+    - deletecollection
+    - get
+    - list
+    - patch
+    - update
+    - watch
+  - apiGroups:
+    - ""
+    attributeRestrictions: null
+    resources:
+    - resourcequotas/status
+    - resourcequotausages
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - ""
+    - quota.openshift.io
+    attributeRestrictions: null
+    resources:
+    - appliedclusterresourcequotas
+    verbs:
+    - get
+    - list
+    - watch

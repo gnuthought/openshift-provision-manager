@@ -75,8 +75,10 @@ def time_to_sec(t):
         return int(m.group(1))
 
 def run_as_ansible():
-    os.setgid(1000)
-    os.setuid(1000)
+    """If running as root, switch to ansible user before executing ansible"""
+    if 0 == os.geteuid():
+        os.setgid(1000)
+        os.setuid(1000)
 
 class ProvisionConfig:
     def __init__(self, namespace, name):
@@ -249,6 +251,9 @@ class ProvisionConfig:
             'openshift_provision_config_path': 
                 self.git_config_path()
         }
+        if 'params' in self.config_data:
+            config_params = yaml.safe_load(self.config_data['params'])
+            extravars.update(config_params)
         with open(private_data_dir + '/env/extravars', 'w') as fh:
             yaml.safe_dump(extravars, fh)
 
@@ -434,13 +439,16 @@ def init_dirs():
     ]:
         if not os.path.isdir(path):
             os.makedirs(path)
+
     # Make cluster ca.crt available to ansible runs
     shutil.copyfile(
         '/run/secrets/kubernetes.io/serviceaccount/ca.crt',
         ansible_runner_base_path + '/ca.crt'
     )
-    # Protect secrets from ansible lookups
-    os.chmod("/run/secrets", 0o700)
+
+    # Protect secrets from ansible lookups when running as root
+    if 0 == os.geteuid():
+        os.chmod("/run/secrets", 0o700)
 
 def init_kube_api():
     """Set kube_api global to communicate with the local kubernetes cluster."""
