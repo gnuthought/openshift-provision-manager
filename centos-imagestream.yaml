@@ -3,8 +3,8 @@ apiVersion: image.openshift.io/v1
 kind: ImageStream
 metadata:
   annotations:
-    openshift.io/display-name: CentOS 7
-  name: centos7
+    openshift.io/display-name: CentOS
+  name: centos
   namespace: openshift
 spec:
   lookupPolicy:

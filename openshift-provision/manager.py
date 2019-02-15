@@ -31,7 +31,6 @@ stat_webhook_call_count = prometheus_client.Counter(
     ['name']
 )
 
-cluster_vars = None
 config_queue = None
 namespace = None
 provision_configs = {}
@@ -165,8 +164,8 @@ class ProvisionConfig:
 
     def git_config_path(self):
         path = self.git_path
-        if 'config_dir' in self.config_data:
-            path += '/' + self.config_data['config_dir']
+        if 'config_path' in self.config_data:
+            path += '/' + self.config_data['config_path']
         return path
 
     def git_clone(self):
@@ -238,23 +237,21 @@ class ProvisionConfig:
         os.chmod(change_record, 0o666)
 
         # Define extravars
+        extravars = {
+            'openshift_connection_certificate_authority': 
+                ansible_runner_base_path + '/ca.crt',
+            'openshift_connection_server': 
+                'https://kubernetes.default.svc',
+            'openshift_connection_token': 
+                self.service_account_token(),
+            'openshift_provision_change_record': 
+                change_record,
+            'openshift_provision_config_path': 
+                self.git_config_path()
+        }
         with open(private_data_dir + '/env/extravars', 'w') as fh:
-            fh.write(
-                "openshift_connection_certificate_authority: {}\n"
-                "openshift_connection_server: {}\n"
-                "openshift_connection_token: {}\n"
-                "openshift_provision_change_record: {}\n"
-                "openshift_provision_cluster_name: {}\n"
-                "openshift_provision_config_path: {}\n"
-                .format(
-                    ansible_runner_base_path + '/ca.crt',
-                    "https://openshift.default.svc",
-                    self.service_account_token(),
-                    change_record,
-                    cluster_vars['cluster_name'],
-                    self.git_config_path()
-                )
-            )
+            yaml.safe_dump(extravars, fh)
+
         shutil.copyfile(
             openshift_provision_playbook,
             private_data_dir + '/project/openshift-provision.yaml')
@@ -429,25 +426,6 @@ def init():
     init_queueing()
     init_service_account_token()
     init_kube_api()
-    init_cluster_vars()
-
-def init_cluster_vars():
-    """
-    Read cluster_vars from kube-public cluster-vars configmap.
-    """
-    # FIXME - Re-read cluster vars
-    global cluster_vars
-    try:
-        cluster_vars = kube_api.read_namespaced_config_map(
-            'cluster-vars',
-            'kube-public'
-        ).data
-        if 'cluster_name' not in cluster_vars:
-            raise Exception("Unable to find cluster_name in cluster-vars configmap!")
-
-    except kubernetes.client.rest.ApiException as e:
-        logger.error("Unable to read cluster-vars configmap from kube-public namespace")
-        raise
 
 def init_dirs():
     for path in [
