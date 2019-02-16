@@ -260,11 +260,12 @@ class ProvisionConfig:
         shutil.copyfile(
             openshift_provision_playbook,
             private_data_dir + '/project/openshift-provision.yaml')
-        if os.path.isdir(self.git_path + '/filter_plugins'):
-            os.symlink(
-                self.git_path + '/filter_plugins',
-                private_data_dir + '/project/filter_plugins'
-            )
+        for dirname in ('files', 'filter_plugins'):
+            if os.path.isdir(self.git_path + '/' + dirname):
+                os.symlink(
+                    self.git_path + '/' + dirname,
+                    private_data_dir + '/project/' + dirname
+                )
         return private_data_dir
 
     def do_ansible_run(self, ansible_dir, check_mode):
