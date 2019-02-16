@@ -81,7 +81,6 @@ objects:
             name: cache
         restartPolicy: Always
         securityContext: {}
-        serviceAccount: ${MANAGER_SERVICE_NAME}
         serviceAccountName: ${MANAGER_SERVICE_NAME}
         terminationGracePeriodSeconds: 30
         volumes:
