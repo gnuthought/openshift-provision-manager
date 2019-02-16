@@ -39,8 +39,6 @@ objects:
     name: openshift-provision-manager-edit
     namespace: ${OPENSHIFT_PROVISION_NAMESPACE}
   roleRef:
-    apiGroup: rbac.authorization.k8s.io
-    kind: ClusterRole
     name: edit
   subjects:
   - kind: ServiceAccount
