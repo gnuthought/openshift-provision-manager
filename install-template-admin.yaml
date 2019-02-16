@@ -47,46 +47,6 @@ objects:
     name: ${MANAGER_SERVICE_NAME}
     namespace: ${OPENSHIFT_PROVISION_NAMESPACE}
 
-- apiVersion: extensions/v1beta1
-  kind: Deployment
-  metadata:
-    labels:
-      component: ${MANAGER_DEPLOYMENT_NAME}
-    name: ${MANAGER_DEPLOYMENT_NAME}
-    namespace: ${OPENSHIFT_PROVISION_NAMESPACE}
-  spec:
-    replicas: 1
-    selector:
-      matchLabels:
-        component: ${MANAGER_DEPLOYMENT_NAME}
-    strategy:
-      type: Recreate
-    template:
-      metadata:
-        labels:
-          component: ${MANAGER_DEPLOYMENT_NAME}
-      spec:
-        containers:
-        - name: manager
-          image: docker-registry.default.svc:5000/openshift/openshift-provision-manager:latest
-          imagePullPolicy: Always
-          # FIXME - Add probes
-          #livenessProbe:
-          #readinessProbe:
-          resources: {}
-          terminationMessagePath: /dev/termination-log
-          terminationMessagePolicy: File
-          volumeMounts:
-          - mountPath: /opt/openshift-provision/cache
-            name: cache
-        restartPolicy: Always
-        securityContext: {}
-        serviceAccountName: ${MANAGER_SERVICE_NAME}
-        terminationGracePeriodSeconds: 30
-        volumes:
-        - emptyDir: {}
-          name: cache
-
 - apiVersion: v1
   kind: Service
   metadata:
@@ -145,6 +105,46 @@ objects:
       name: latest
       referencePolicy:
         type: Local
+
+- apiVersion: extensions/v1beta1
+  kind: Deployment
+  metadata:
+    labels:
+      component: ${MANAGER_DEPLOYMENT_NAME}
+    name: ${MANAGER_DEPLOYMENT_NAME}
+    namespace: ${OPENSHIFT_PROVISION_NAMESPACE}
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        component: ${MANAGER_DEPLOYMENT_NAME}
+    strategy:
+      type: Recreate
+    template:
+      metadata:
+        labels:
+          component: ${MANAGER_DEPLOYMENT_NAME}
+      spec:
+        containers:
+        - name: manager
+          image: docker-registry.default.svc:5000/openshift/openshift-provision-manager:latest
+          imagePullPolicy: Always
+          # FIXME - Add probes
+          #livenessProbe:
+          #readinessProbe:
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /opt/openshift-provision/cache
+            name: cache
+        restartPolicy: Always
+        securityContext: {}
+        serviceAccountName: ${MANAGER_SERVICE_NAME}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - emptyDir: {}
+          name: cache
 
 - apiVersion: authorization.openshift.io/v1
   kind: ClusterRole
