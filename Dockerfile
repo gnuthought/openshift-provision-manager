@@ -5,6 +5,7 @@ USER 0
 
 RUN yum install -y \
       centos-release-openshift-origin311 \
+      epel-release \
       gcc \
       git \
       python \
@@ -12,6 +13,7 @@ RUN yum install -y \
       python-jmespath \
       python-setuptools && \
     yum install -y \
+      nss_wrapper \
       origin-clients && \
     yum clean all && \
     useradd -u 1000 ansible

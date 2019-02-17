@@ -34,13 +34,16 @@ stat_webhook_call_count = prometheus_client.Counter(
 config_queue = None
 namespace = None
 provision_configs = {}
-git_base_path = os.environ.get('GIT_CHECKOUT_DIR', '/opt/openshift-provision/cache/git')
-ansible_runner_base_path = os.environ.get('ANSIBLE_RUNNER_DIR', '/opt/openshift-provision/cache/ansible-runner')
+cache_dir = os.environ.get('CACHE_DIR', '/opt/openshift-provision/cache')
+git_base_path = os.environ.get('GIT_CHECKOUT_DIR', cache_dir + '/git')
+ansible_runner_base_path = os.environ.get('ANSIBLE_RUNNER_DIR', cache_dir + '/ansible-runner')
+nss_wrapper_passwd = cache_dir + '/passwd'
 default_retry_interval = os.environ.get('RETRY_INTERVAL', '10m')
 default_run_interval = os.environ.get('RUN_INTERVAL', '30m')
-git_env = {
-    "GIT_COMMITTER_NAME": "openshift-provision",
-    "GIT_COMMITTER_EMAIL": "openshift-provision@gmail.com"
+process_env = {
+    'HOME': cache_dir,
+    'LD_PRELOAD': 'libnss_wrapper.so',
+    'NSS_WRAPPER_PASSWD': nss_wrapper_passwd
 }
 kube_api = None
 logger = None
@@ -172,40 +175,33 @@ class ProvisionConfig:
 
     def git_clone(self):
         logger.info("Performing git clone for " + self.name)
-        subprocess.check_call(
-            [
-                'git', 'clone', self.git_uri(),
-                '--single-branch', '--branch', self.git_branch(),
-                self.git_path
-            ],
-            env = git_env,
-            stderr = sys.stderr
+        git_cmd = [
+            'git', 'clone', self.git_uri(),
+            '--branch', self.git_branch(),
+            '--depth', '1',
+            '--single-branch',
+            self.git_path
+        ]
+        git = subprocess.Popen(
+            git_cmd,
+            env = process_env,
+            stderr = subprocess.STDOUT,
+            stdout = subprocess.PIPE
         )
-
-    def git_pull(self):
-        logger.info("Pulling git updates for " + self.name)
-        subprocess.check_call(
-            [
-                'git', 'fetch', '--force', 'origin'
-            ],
-            cwd = self.git_path,
-            env = git_env,
-            stderr = sys.stderr
-        )
-        subprocess.check_call(
-            [
-                'git', 'reset', '--hard', 'origin/' + self.git_branch()
-            ],
-            cwd = self.git_path,
-            env = git_env,
-            stderr = sys.stderr
-        )
+        while True:
+            output = git.stdout.readline()
+            if output == '' and git.poll() is not None:
+                break
+            output = re.sub(r' *\**\n$', '', output)
+            if output:
+                logger.info("git - " + output)
+        logger.info("Return code {}".format(git.returncode))
+        return git
 
     def git_refresh(self):
         if os.path.isdir(self.git_path):
-            self.git_pull()
-        else:
-            self.git_clone()
+            shutil.rmtree(self.git_path)
+        self.git_clone()
 
     def run_openshift_provision_ansible(self):
         self.last_run_time = time.time()
@@ -280,7 +276,7 @@ class ProvisionConfig:
         ansible_run = subprocess.Popen(
             ansible_cmd,
             cwd = ansible_dir + '/project',
-            env = { "HOME": "/home/ansible" },
+            env = process_env,
             preexec_fn = run_as_ansible,
             stderr = subprocess.STDOUT,
             stdout = subprocess.PIPE
@@ -291,7 +287,7 @@ class ProvisionConfig:
                 break
             output = re.sub(r' *\**\n$', '', output)
             if output:
-                logger.info(output)
+                logger.info('ansible - ' + output)
         logger.info("Return code {}".format(ansible_run.returncode))
         return ansible_run
 
@@ -448,8 +444,16 @@ def init_dirs():
     )
 
     # Protect secrets from ansible lookups when running as root
-    if 0 == os.geteuid():
+    euid = os.geteuid()
+    if 0 == euid:
         os.chmod("/run/secrets", 0o700)
+    else:
+        fh = open(nss_wrapper_passwd, 'w')
+        fh.write("manager:x:{}:0:manager:{}:/bin/bash".format(
+            euid,
+            ansible_runner_base_path
+        ))
+        ansible_runner_base_path
 
 def init_kube_api():
     """Set kube_api global to communicate with the local kubernetes cluster."""
@@ -470,7 +474,7 @@ def init_logging():
     """
     global logger
     logging.basicConfig(
-        format='%(asctime)-15s %(levelname)s %(threadName)s - %(message)s',
+        format='%(levelname)s %(threadName)s - %(message)s',
     )
     logger = logging.getLogger('manager')
     logger.setLevel(os.environ.get('LOGGING_LEVEL', 'INFO'))
