@@ -12,9 +12,6 @@ RUN yum install -y \
       python-devel \
       python-jmespath \
       python-setuptools && \
-    yum install -y \
-      nss_wrapper \
-      origin-clients && \
     yum clean all && \
     useradd -u 1000 ansible
 
@@ -28,6 +25,6 @@ RUN easy_install pip && \
     git clone --branch=master --single-branch \
       ${OPENSHIFT_PROVISION_REPO} /etc/ansible/roles/openshift-provision
 
-COPY openshift-provision /opt/openshift-provision
+COPY manager.py /opt/openshift-provision/
 
 CMD /opt/openshift-provision/manager.py

@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 import base64
-import datetime
 import flask
 import gevent.pywsgi
 import kubernetes
@@ -9,13 +8,13 @@ import kubernetes.client.rest
 import logging
 import os
 import prometheus_client
+import random
 import re
-import shutil
-import subprocess
+import socket
 import sys
+import string
 import threading
 import time
-import yaml
 
 api = flask.Flask('rest')
 
@@ -23,7 +22,7 @@ stat_config_state = prometheus_client.Enum(
     'config_state',
     'Configuration state',
     ['name'],
-    states=['new','provisioned','changed','failed','removed']
+    states=['unknown','provisioned','changed','failed','removed']
 )
 stat_webhook_call_count = prometheus_client.Counter(
     'webhook_call_count',
@@ -33,23 +32,18 @@ stat_webhook_call_count = prometheus_client.Counter(
 
 config_queue = None
 namespace = None
+pod_ip = socket.gethostbyname(os.environ['HOSTNAME'])
 provision_configs = {}
-cache_dir = os.environ.get('CACHE_DIR', '/opt/openshift-provision/cache')
-git_base_path = os.environ.get('GIT_CHECKOUT_DIR', cache_dir + '/git')
-ansible_runner_base_path = os.environ.get('ANSIBLE_RUNNER_DIR', cache_dir + '/ansible-runner')
-nss_wrapper_passwd = cache_dir + '/passwd'
+runner_pods = {}
 default_retry_interval = os.environ.get('RETRY_INTERVAL', '10m')
 default_run_interval = os.environ.get('RUN_INTERVAL', '30m')
-process_env = {
-    'HOME': cache_dir,
-    'LD_PRELOAD': 'libnss_wrapper.so',
-    'NSS_WRAPPER_PASSWD': nss_wrapper_passwd
-}
 kube_api = None
 logger = None
-openshift_provision_playbook = os.environ.get('OPENSHIFT_PROVISION_PLAYBOOK', '/opt/openshift-provision/openshift-provision.yaml')
-provision_config_lock = threading.RLock()
 provision_start_release = threading.Lock()
+runner_image = os.environ.get(
+    'RUNNER_IMAGE',
+    'docker.io/gnuthought/openshift-provision-runner:latest'
+)
 service_account_token = None
 
 class ProvisionConfigInvalidError(Exception):
@@ -59,6 +53,14 @@ class ProvisionConfigRemovedError(Exception):
 
 def is_truthy(s):
     return s in ['yes', 'Yes', 'true', 'True']
+
+def random_string(n):
+    return ''.join(
+        random.choice(
+            string.ascii_lowercase +
+            string.digits
+        ) for _ in range(n)
+    )
 
 def time_to_sec(t):
     if sys.version_info < (3,):
@@ -77,50 +79,34 @@ def time_to_sec(t):
     else:
         return int(m.group(1))
 
-def run_as_ansible():
-    """If running as root, switch to ansible user before executing ansible"""
-    if 0 == os.geteuid():
-        os.setgid(1000)
-        os.setuid(1000)
-
 class ProvisionConfig:
-    def __init__(self, namespace, name):
+    def __init__(self, name):
         self.config_data = {}
-        self.git_path = '{}/{}'.format(git_base_path, name)
-        self.last_run_return = None
+        self.change_yaml = '# unknown'
         self.last_run_time = 0
-        self.lock = threading.Lock()
         self.name = name
-        self.namespace = namespace
         self.next_time_no_check_mode = False
         self.pod_name = None
+        self.pod_running = False
         self.retry_interval = default_retry_interval
         self.run_interval = default_run_interval
+        self.state = 'unknown'
 
     def provision(self):
         self.configmap_refresh()
-        self.git_refresh()
-        self.run_openshift_provision_ansible()
+        self.start_run()
 
     def configmap_refresh(self):
         try:
             self.config_data = kube_api.read_namespaced_config_map(
                 self.name,
-                self.namespace
+                namespace
             ).data
-            self.config_data_sanitycheck()
         except kubernetes.client.rest.ApiException as e:
             if e.status == 404:
                 raise ProvisionConfigRemovedError
             else:
                 raise
-
-    def config_data_sanitycheck(self):
-        for reqfield in ['git_uri']:
-            if reqfield not in self.config_data:
-                raise ProvisionConfigInvalidError(
-                    'Missing required field ' + reqfield
-                )
 
     def check_mode(self):
         if self.next_time_no_check_mode:
@@ -136,211 +122,211 @@ class ProvisionConfig:
             return self.config_data['service_account']
         return self.name
 
-    def webhook_key(self):
-        if 'webhook_secret' in self.config_data:
-            secret = kube_api.read_namespaced_secret(
-                self.config_data['webhook_secret'],
-                namespace
-            )
-            return base64.b64decode(secret.data['key'])
-        elif 'webhook_key' in self.config_data:
-            return self.config_data['webhook_key']
-        return None
-
-    def service_account_token(self):
-        service_account_name = self.service_account()
-        service_account = kube_api.read_namespaced_service_account(
-            service_account_name,
-            namespace
+    def callback_url(self):
+        '''Return URL for runner pod callback'''
+        return 'http://{}:5000/callback/{}/{}'.format(
+            pod_ip,
+            self.name,
+            self.callback_key()
         )
-        for secret in service_account.secrets:
-            if secret.name.startswith(service_account_name + '-token-'):
+
+    def callback_key(self):
+        '''Get callback key value or generate value if needed'''
+        if 'callback_key' in self.config_data:
+            return self.config_data['callback_key']
+        else:
+            callback_secret = self.config_data.get(
+                'callback_secret',
+                self.name + '-callback'
+            )
+            try:
                 secret = kube_api.read_namespaced_secret(
-                    secret.name,
+                    callback_secret,
                     namespace
                 )
-                return base64.b64decode(secret.data['token'])
-
-    def git_uri(self):
-        return self.config_data['git_uri']
-
-    def git_branch(self):
-        return self.config_data.get('git_branch', 'master')
-
-    def git_config_path(self):
-        path = self.git_path
-        if 'config_path' in self.config_data:
-            path += '/' + self.config_data['config_path']
-        return path
-
-    def git_clone(self):
-        logger.info("Performing git clone for " + self.name)
-        git_cmd = [
-            'git', 'clone', self.git_uri(),
-            '--branch', self.git_branch(),
-            '--depth', '1',
-            '--single-branch',
-            self.git_path
-        ]
-        git = subprocess.Popen(
-            git_cmd,
-            env = process_env,
-            stderr = subprocess.STDOUT,
-            stdout = subprocess.PIPE
-        )
-        while True:
-            output = git.stdout.readline()
-            if output == '' and git.poll() is not None:
-                break
-            output = re.sub(r' *\**\n$', '', output)
-            if output:
-                logger.info("git - " + output)
-        logger.info("Return code {}".format(git.returncode))
-        return git
-
-    def git_refresh(self):
-        if os.path.isdir(self.git_path):
-            shutil.rmtree(self.git_path)
-        self.git_clone()
-
-    def run_openshift_provision_ansible(self):
-        self.last_run_time = time.time()
-        check_mode = self.check_mode()
-        ansible_dir = self.prepare_ansible_runner_dir()
-        ansible_run = self.do_ansible_run(ansible_dir, check_mode)
-        self.record_run_result(ansible_run, ansible_dir)
-        self.queue_next_run(ansible_run)
-
-    def prepare_ansible_runner_dir(self):
-        """
-        Prepare directory for ansible run. Originally this was designed for use
-        with ansible-runner, but then it was fonud that ansible runner does not
-        expose a change record.
-        """
-        logger.debug("Preparing ansible runner for " + self.name)
-        private_data_dir = "{}/{}".format(ansible_runner_base_path, self.name)
-        change_record = private_data_dir + "/change-record.yaml"
-        if os.path.isdir(private_data_dir):
-            shutil.rmtree(private_data_dir)
-        for subdir in ('env', 'project'):
-            os.makedirs(private_data_dir + '/' + subdir)
-
-        # Initialize change record
-        with open(change_record, "w") as fh:
-            fh.write("# Ansible run for {} - {}Z\n".format(
-                self.name,
-                datetime.datetime.utcnow().isoformat()
-            ))
-        # Make change record writable for ansible
-        os.chmod(change_record, 0o666)
-
-        # Define extravars
-        extravars = {
-            'openshift_connection_certificate_authority': 
-                ansible_runner_base_path + '/ca.crt',
-            'openshift_connection_server': 
-                'https://kubernetes.default.svc',
-            'openshift_connection_token': 
-                self.service_account_token(),
-            'openshift_provision_change_record': 
-                change_record,
-            'openshift_provision_config_path': 
-                self.git_config_path()
-        }
-        if 'params' in self.config_data:
-            config_params = yaml.safe_load(self.config_data['params'])
-            extravars.update(config_params)
-        with open(private_data_dir + '/env/extravars', 'w') as fh:
-            yaml.safe_dump(extravars, fh)
-
-        shutil.copyfile(
-            openshift_provision_playbook,
-            private_data_dir + '/project/openshift-provision.yaml')
-        for dirname in ('files', 'filter_plugins'):
-            if os.path.isdir(self.git_path + '/' + dirname):
-                os.symlink(
-                    self.git_path + '/' + dirname,
-                    private_data_dir + '/project/' + dirname
+                return base64.b64decode(secret.data['key'])
+            except kubernetes.client.rest.ApiException as e:
+                if e.status != 404:
+                    raise
+            return_key = random_string(16)
+            kube_api.create_namespaced_secret(
+                namespace,
+                kubernetes.client.V1Secret(
+                    metadata = kubernetes.client.V1ObjectMeta(
+                        name = callback_secret
+                    ),
+                    data = {
+                        'key': base64.b64encode(return_key)
+                    }
                 )
-        return private_data_dir
+            )
+            return return_key
 
-    def do_ansible_run(self, ansible_dir, check_mode):
-        ansible_cmd = [
-            "ansible-playbook",
-            "--extra-vars=@{}/env/extravars".format(ansible_dir),
-            "openshift-provision.yaml"
-        ]
-        if check_mode:
-            ansible_cmd.append('--check')
-        # FIXME --vault-password-file support?
-        ansible_run = subprocess.Popen(
-            ansible_cmd,
-            cwd = ansible_dir + '/project',
-            env = process_env,
-            preexec_fn = run_as_ansible,
-            stderr = subprocess.STDOUT,
-            stdout = subprocess.PIPE
-        )
-        while True:
-            output = ansible_run.stdout.readline()
-            if output == '' and ansible_run.poll() is not None:
-                break
-            output = re.sub(r' *\**\n$', '', output)
-            if output:
-                logger.info('ansible - ' + output)
-        logger.info("Return code {}".format(ansible_run.returncode))
-        return ansible_run
-
-    def record_run_result(self, ansible_run, ansible_dir):
-        self.last_run_return = ansible_run.returncode
-        change_record = ansible_dir + "/change-record.yaml"
-        change_yaml = None
-        if os.path.isfile(change_record):
-            with open(change_record) as f:
-               change_yaml = f.read()
-
-        if ansible_run.returncode != 0:
-            state = 'failed'
-        elif change_yaml \
-        and '---' in change_yaml:
-            # Changed if there are change records in the yaml document
-            state = 'changed'
+    def webhook_key(self):
+        '''Get webhook key value from config or secret'''
+        if 'webhook_key' in self.config_data:
+            return self.config_data['webhook_key']
         else:
-            state = 'provisioned'
+            webhook_secret = self.config_data.get(
+                'webhook_secret',
+                self.name + '-webhook'
+            )
+            try:
+                secret = kube_api.read_namespaced_secret(
+                    webhook_secret,
+                    namespace
+                )
+                return base64.b64decode(secret.data['key'])
+            except kubernetes.client.rest.ApiException as e:
+                if e.status != 404:
+                    raise
+            return None
 
-        stat_config_state.labels(self.name).state(state)
-        self.update_status_config_map(
-            change_yaml = change_yaml,
-            state = state
+    def ansible_vars(self):
+        return self.config_data.get('vars', '{}')
+
+    def git_url(self):
+        return self.config_data.get('git_url', '')
+
+    def git_ref(self):
+        return self.config_data.get('git_ref', 'master')
+
+    def start_run(self):
+        if self.pod_running:
+            raise Exception(
+                '{} in start_run when pod {} is thought to be running'.format(
+                    self.name,
+                    self.pod_name
+                )
+            )
+        if self.pod_name:
+            delete_runner_pod(self.pod_name)
+        self.pod_name = None
+        self.last_run_time = time.time()
+        self.start_runner_pod()
+        self.update_status_config_map()
+
+    def start_runner_pod(self):
+        check_mode = self.check_mode()
+        pod_name = 'ansible-runner-{}-{}'.format(
+            self.name,
+            random_string(5)
         )
+        kube_api.create_namespaced_pod(
+            namespace,
+            kubernetes.client.V1Pod(
+                metadata = kubernetes.client.V1ObjectMeta(
+                    name = pod_name,
+                    labels = {
+                        'openshift-provision.gnuthought.com/configmap': self.name,
+                        'openshift-provision.gnuthought.com/runner': 'true'
+                    }
+                ),
+                spec = kubernetes.client.V1PodSpec(
+                    containers = [
+                        kubernetes.client.V1Container(
+                            name = 'runner',
+                            env = [
+                                kubernetes.client.V1EnvVar(
+                                    name = 'ANSIBLE_VARS',
+                                    value = self.ansible_vars()
+                                ),
+                                kubernetes.client.V1EnvVar(
+                                    name = 'CALLBACK_URL',
+                                    value = self.callback_url()
+                                ),
+                                kubernetes.client.V1EnvVar(
+                                    name = 'CHECK_MODE',
+                                    value = 'true' if check_mode else 'false'
+                                ),
+                                kubernetes.client.V1EnvVar(
+                                    name = 'GIT_REF',
+                                    value = self.git_ref()
+                                ),
+                                kubernetes.client.V1EnvVar(
+                                    name = 'GIT_URL',
+                                    value = self.git_url()
+                                )
+                            ],
+                            image = runner_image,
+                            image_pull_policy = "Always",
+                            volume_mounts = [
+                                kubernetes.client.V1VolumeMount(
+                                    mount_path = '/opt/openshift-provision/run',
+                                    name = 'rundir'
+                                )
+                            ]
+                        )
+                    ],
+                    restart_policy = 'Never',
+                    service_account_name = self.service_account(),
+                    volumes = [
+                        kubernetes.client.V1Volume(
+                            name = 'rundir',
+                            empty_dir = kubernetes.client.V1EmptyDirVolumeSource()
+                        )
+                    ]
+                )
+            )
+        )
+        self.pod_name = pod_name
+        runner_pods[pod_name] = self
+        self.pod_running = True
+
+    def handle_run_result(self, change_yaml):
+        self.record_run_result(change_yaml)
+        self.queue_next_run()
+
+    def record_run_result(self, change_yaml):
+        self.change_yaml = change_yaml
+        if '---' in change_yaml:
+            # Changed if there are change records in the yaml document
+            self.state = 'changed'
+        else:
+            self.state = 'provisioned'
+        stat_config_state.labels(self.name).state(self.state)
+        self.update_status_config_map()
+
+    def handle_run_failure(self):
+        self.record_run_failure()
+        self.queue_next_run()
+
+    def record_run_failure(self):
+        self.change_yaml = "# FAILED"
+        self.pod_running = False
+        self.state = 'failed'
+        self.update_status_config_map()
 
     def get_status_config_map(self):
         status_config_map = None
         try:
             status_config_map = kube_api.read_namespaced_config_map(
                 self.name + '-status',
-                self.namespace
+                namespace
             ).data
         except kubernetes.client.rest.ApiException as e:
             if e.status != 404:
                 raise
         return status_config_map
 
-    def update_status_config_map(self, change_yaml, state):
-        status_config_map = self.get_status_config_map()
+    def update_status_config_map(self):
         status_data = {
-            "changes": change_yaml,
-            "state": state
+            'changes': self.change_yaml,
+            'pod_running': 'true' if self.pod_running else 'false',
+            'state': self.state
         }
-        if status_config_map:
+        if self.pod_name:
+            status_data['pod_name'] = self.pod_name
+
+        if self.get_status_config_map():
             kube_api.patch_namespaced_config_map(
                 self.name + '-status',
-                self.namespace,
+                namespace,
                 { "data": status_data }
             )
         else:
             kube_api.create_namespaced_config_map(
-                self.namespace,
+                namespace,
                 kubernetes.client.V1ConfigMap(
                     metadata = kubernetes.client.V1ObjectMeta(
                         name = self.name + '-status',
@@ -352,11 +338,11 @@ class ProvisionConfig:
                 )
             )
 
-    def queue_next_run(self, ansible_run):
-        if ansible_run.returncode == 0:
-            config_queue.push(self.name, self.run_interval)
-        else:
+    def queue_next_run(self):
+        if self.state == 'failed':
             config_queue.push(self.name, self.retry_interval)
+        else:
+            config_queue.push(self.name, self.run_interval)
 
 class ConfigQueue:
     """
@@ -409,8 +395,12 @@ class ConfigQueue:
         name = None
         self.lock.acquire()
         self._process_delay_queue()
-        if self.queue:
-            name = self.queue.pop()
+        name = None
+        for i in range(len(self.queue)):
+             config = provision_configs[self.queue[i]]
+             if not config.pod_running:
+                 name = self.queue.pop(i)
+                 break
         self.lock.release()
         return name
     def remove(self, name):
@@ -422,38 +412,13 @@ class ConfigQueue:
 
 def init():
     """Initialization function before management loops."""
-    init_dirs()
     init_logging()
     init_namespace()
-    init_queueing()
     init_service_account_token()
     init_kube_api()
-
-def init_dirs():
-    for path in [
-        git_base_path,
-        ansible_runner_base_path
-    ]:
-        if not os.path.isdir(path):
-            os.makedirs(path)
-
-    # Make cluster ca.crt available to ansible runs
-    shutil.copyfile(
-        '/run/secrets/kubernetes.io/serviceaccount/ca.crt',
-        ansible_runner_base_path + '/ca.crt'
-    )
-
-    # Protect secrets from ansible lookups when running as root
-    euid = os.geteuid()
-    if 0 == euid:
-        os.chmod("/run/secrets", 0o700)
-    else:
-        fh = open(nss_wrapper_passwd, 'w')
-        fh.write("manager:x:{}:0:manager:{}:/bin/bash".format(
-            euid,
-            ansible_runner_base_path
-        ))
-        ansible_runner_base_path
+    init_provision_configs()
+    init_runner_pods()
+    init_queueing()
 
 def init_kube_api():
     """Set kube_api global to communicate with the local kubernetes cluster."""
@@ -498,12 +463,85 @@ def init_service_account_token():
     with open('/run/secrets/kubernetes.io/serviceaccount/token') as f:
         service_account_token = f.read()
 
+def init_provision_configs():
+    '''
+    Get list of configmaps and set provision_configs without triggering
+    processing.
+    '''
+    for config_map in kube_api.list_namespaced_config_map(
+        namespace,
+        label_selector = "openshift-provision.gnuthought.com/config=true"
+    ).items:
+        add_config(config_map.metadata.name)
+
+def init_runner_pods():
+    '''
+    Cleanup any old stopped pods and add record of any running pods.
+    '''
+    for pod in kube_api.list_namespaced_pod(
+        namespace,
+        label_selector = "openshift-provision.gnuthought.com/runner=true"
+    ).items:
+        handle_runner_pod(pod)
+
+def handle_runner_pod(pod):
+    config_name = pod.metadata.labels.get(
+        'openshift-provision.gnuthought.com/configmap',
+        None
+    )
+    if config_name == None:
+        logger.warn("Ignoring runner pod {} without configmap label".format(
+            pod.metadata.name
+        ))
+    elif config_name not in provision_configs:
+        logger.warn("Deleting runner pod {} with unknown configmap: {}".format(
+            pod.metadata.name,
+            config_name
+        ))
+        delete_runner_pod(pod.metadata.name)
+    else:
+        config = provision_configs[config_name]
+        if pod.metadata.deletion_timestamp:
+            logger.debug("Ignoring pod {} with deletion timestamp".format(
+                pod.metadata.name
+            ))
+        elif config.pod_name == None:
+            logger.info("Recording that {} pod {} belongs to {}".format(
+                pod.status.phase,
+                pod.metadata.name,
+                config_name
+            ))
+            config.pod_name = pod.metadata.name
+            if pod.status.phase in ('Pending', 'Running'):
+                config.pod_running = True
+        elif pod.metadata.name != config.pod_name:
+            logger.warn("Found unexpected {} pod {} for {}, deleting it".format(
+                pod.status.phase,
+                pod.metadata.name,
+                config_name
+            ))
+            delete_runner_pod(pod.metadata.name)
+        elif pod.status.phase in ('Failed', 'Unknown'):
+            logger.warn("Pod {} for {} found in {} state".format(
+                pod.metadata.name,
+                config_name,
+                pod.status.phase
+            ))
+            config.handle_run_failure()
+        elif pod.status.phase == 'Succeeded':
+            config.pod_running = False
+            logger.info("Pod {} for {} suceeeded".format(
+                pod.metadata.name,
+                config_name,
+                pod.status.phase
+            ))
+
 def signal_provision_start():
     """
     Signal provision loop that there is work to be done
 
-    This is done by releasing the provision_start_release lock. This lock may
-    already released.
+    This is done by releasing the provision_start_release lock. This
+    lock may be already released.
     """
     logger.debug("Signaling provision start")
     try:
@@ -550,19 +588,30 @@ def provision_config_queue():
             provision_config(config)
         config_name = config_queue.pop()
 
+def handle_lost_runner_pods():
+    '''
+    Loop through provision configs and check for pods that have been
+    lost though the current state shows they should be running.
+
+    This handles the case of a runner pod being manually deleted.
+    '''
+    # FIXME
+    pass
+
 def provision_loop():
     while True:
         try:
             provision_start_release.acquire()
             provision_config_queue()
+            handle_lost_runner_pods()
         except Exception as e:
             logger.exception("Error in provision_loop " + str(e))
             time.sleep(60)
 
 def provision_trigger_loop():
     """
-    Periodically release the provision_start_release lock to trigger scheduled
-    provisioning.
+    Periodically release the provision_start_release lock to trigger
+    scheduled provisioning.
     """
     while True:
         try:
@@ -573,14 +622,10 @@ def provision_trigger_loop():
             logger.exception("Error in provision_trigger_loop " + str(e))
             time.sleep(60)
 
-def set_config(name):
+def add_config(name):
     if name not in provision_configs:
-        provision_configs[name] = ProvisionConfig(
-            namespace,
-            name
-        )
-        stat_config_state.labels(name).state('new')
-    config_queue.push(name)
+        provision_configs[name] = ProvisionConfig(name)
+        stat_config_state.labels(name).state('unknown')
 
 def remove_config(name):
     config_queue.remove(name)
@@ -596,11 +641,12 @@ def watch_config_maps():
         label_selector = "openshift-provision.gnuthought.com/config=true"
     ):
         config_map = event['object']
-        if event['type'] in ['ADDED','MODIFIED']:
+        if event['type'] in ('ADDED','MODIFIED'):
             if config_map.metadata.deletion_timestamp:
                 remove_config(config_map.metadata.name)
             else:
-                set_config(config_map.metadata.name)
+                add_config(config_map.metadata.name)
+                config_queue.push(config_map.metadata.name)
 
 def watch_config_maps_loop():
     while True:
@@ -609,6 +655,34 @@ def watch_config_maps_loop():
             watch_config_maps()
         except Exception as e:
             logger.exception("Error in watch_config_maps " + str(e))
+            time.sleep(60)
+
+def delete_runner_pod(pod_name):
+    logger.debug('Deleting pod ' + pod_name)
+    kube_api.delete_namespaced_pod(
+        pod_name,
+        namespace,
+        {}
+    )
+
+def watch_pods():
+    w = kubernetes.watch.Watch()
+    for event in w.stream(
+        kube_api.list_namespaced_pod,
+        namespace,
+        label_selector = "openshift-provision.gnuthought.com/runner=true"
+    ):
+        pod = event['object']
+        if event['type'] in ('ADDED','MODIFIED'):
+            handle_runner_pod(pod)
+
+def pod_management_loop():
+    while True:
+        try:
+            logger.debug("Starting watch for pods")
+            watch_pods()
+        except Exception as e:
+            logger.exception("Error in watch_pods " + str(e))
             time.sleep(60)
 
 @api.route('/provision/<string:name>/<string:key>', methods=['POST'])
@@ -628,8 +702,8 @@ def api_provision(name, key):
     config_queue.push(name)
     return flask.jsonify({'status': 'queued'})
 
-@api.route('/queue/<string:name>/<string:key>', methods=['POST'])
-def api_queue(name, key):
+@api.route('/check/<string:name>/<string:key>', methods=['POST'])
+def api_check(name, key):
     logger.info("Webhook invoked for {}".format(name))
     if name not in provision_configs:
         logger.warn("Webhook {} not found".format(name))
@@ -643,6 +717,21 @@ def api_queue(name, key):
     stat_webhook_call_count.labels(name).inc()
     config_queue.push(name)
     return flask.jsonify({'status': 'queued'})
+
+@api.route('/callback/<string:name>/<string:key>', methods=['POST'])
+def api_callback(name, key):
+    logger.info("Callback invoked for {}".format(name))
+    if name not in provision_configs:
+        logger.warn("Callback {} not found".format(name))
+        flask.abort(404)
+        return
+    config = provision_configs[name]
+    if key != config.callback_key():
+        logger.warn("Invalid callback key for {}".format(name))
+        flask.abort(403)
+        return
+    provision_configs[name].handle_run_result(flask.request.data)
+    return flask.jsonify({'status': 'ok'})
 
 def main():
     """Main function."""
@@ -658,6 +747,10 @@ def main():
     threading.Thread(
         name = 'Trigger',
         target = provision_trigger_loop
+    ).start()
+    threading.Thread(
+        name = 'PodManager',
+        target = pod_management_loop
     ).start()
     prometheus_client.start_http_server(8000)
     http_server  = gevent.pywsgi.WSGIServer(('', 5000), api)

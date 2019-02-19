@@ -13,8 +13,12 @@ parameters:
   value: manager
 - name: MANAGER_SERVICE_NAME
   value: manager
+- name: IMAGE_BASE
+  value: docker.io/gnuthought/
 - name: MANAGER_IMAGE
-  value: docker.io/gnuthought/openshift-provision-manager:latest
+  value: openshift-provision-manager:latest
+- name: RUNNER_IMAGE
+  value: openshift-provision-manager:latest
 
 objects:
 - apiVersion: project.openshift.io/v1
@@ -99,7 +103,31 @@ objects:
         tags: openshift-provision-manager
       from:
         kind: DockerImage
-        name: ${MANAGER_IMAGE}
+        name: ${IMAGE_BASE}${MANAGER_IMAGE}
+      importPolicy:
+        scheduled: true
+      name: latest
+      referencePolicy:
+        type: Local
+
+- apiVersion: image.openshift.io/v1
+  kind: ImageStream
+  metadata:
+    annotations:
+      openshift.io/display-name: openshift-provision-runner
+    name: openshift-provision-runner
+    namespace: openshift
+  spec:
+    lookupPolicy:
+      local: false
+    tags:
+    - annotations:
+        description: openshift-provision-runner
+        openshift.io/display-name: openshift-provision-runner
+        tags: openshift-provision-runner
+      from:
+        kind: DockerImage
+        name: ${IMAGE_BASE}${RUNNER_IMAGE}
       importPolicy:
         scheduled: true
       name: latest
@@ -127,6 +155,9 @@ objects:
       spec:
         containers:
         - name: manager
+          env:
+          - name: RUNNER_IMAGE
+            value: docker-registry.default.svc:5000/openshift/openshift-provision-runner:latest
           image: docker-registry.default.svc:5000/openshift/openshift-provision-manager:latest
           imagePullPolicy: Always
           # FIXME - Add probes
@@ -135,16 +166,10 @@ objects:
           resources: {}
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
-          volumeMounts:
-          - mountPath: /opt/openshift-provision/cache
-            name: cache
         restartPolicy: Always
         securityContext: {}
         serviceAccountName: ${MANAGER_SERVICE_NAME}
         terminationGracePeriodSeconds: 30
-        volumes:
-        - emptyDir: {}
-          name: cache
 
 - apiVersion: authorization.openshift.io/v1
   kind: ClusterRole
