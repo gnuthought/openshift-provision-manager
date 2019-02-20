@@ -11,7 +11,7 @@ import sys
 import yaml
 
 run_dir = os.environ.get('RUN_DIR', '/opt/openshift-provision/run')
-git_dir = run_dir + '/git'
+namespace = None
 nss_wrapper_passwd = run_dir + '/passwd'
 logger = None
 
@@ -39,7 +39,7 @@ def get_service_account_token():
 
 def report_changes():
     logger.debug("Sending change record to callback url")
-    change_yaml = open(run_dir + '/change-record.yaml')
+    change_yaml = open(run_dir + '/change-record.yaml').read()
     r = requests.post(
         os.environ['CALLBACK_URL'],
         data = change_yaml,
@@ -64,16 +64,13 @@ def prepare_ansible_dir():
     """
     logger.debug("Preparing ansible directory")
     change_record = run_dir + "/change-record.yaml"
-    for subdir in ('env', 'project'):
-        os.makedirs(run_dir + '/' + subdir)
+    os.makedirs(run_dir + '/env')
 
-    # Symlink to git config
-    for dirname in ('files', 'filter_plugins', 'templates'):
-        if os.path.isdir(git_dir + '/' + dirname):
-            os.symlink(
-                git_dir + '/' + dirname,
-                run_dir + '/project/' + dirname
-            )
+    # Symlink project to git repo
+    if os.environ.get('GIT_URL', '') != '':
+        git_clone()
+    else:
+        os.mkdir(run_dir + '/project')
 
     # Initialize change record
     with open(change_record, "w") as fh:
@@ -84,17 +81,23 @@ def prepare_ansible_dir():
     # Define extravars
     extravars = yaml.safe_load(os.environ.get('ANSIBLE_VARS', '{}'))
     extravars.update({
-        'openshift_connection_certificate_authority': 
+        'openshift_connection_certificate_authority':
             '/run/secrets/kubernetes.io/serviceaccount/ca.crt',
-        'openshift_connection_server': 
+        'openshift_connection_server':
             'https://kubernetes.default.svc',
-        'openshift_connection_token': 
+        'openshift_connection_token':
             get_service_account_token(),
-        'openshift_provision_change_record': 
+        'openshift_provision_change_record':
             change_record,
-        'openshift_provision_config_path': 
-            git_dir
+        'openshift_provision_manager_namespace':
+            namespace
     })
+
+    if os.environ.get('CONFIG_PATH', '') != '':
+        extravars['openshift_provision_config_path'] = os.environ['CONFIG_PATH'].split()
+    else:
+        extravars['openshift_provision_config_path'] = []
+
     with open(run_dir + '/env/extravars', 'w') as fh:
         yaml.safe_dump(extravars, fh)
 
@@ -135,10 +138,11 @@ def do_ansible_run():
     return ansible_run
 
 def git_clone():
+    # FIXME - Support git credentials
     logger.info("Performing git clone")
     git_cmd = [
         'git', 'clone', os.environ['GIT_URL'],
-        git_dir
+        run_dir + '/project'
     ]
     git = subprocess.Popen(
         git_cmd,
@@ -157,16 +161,18 @@ def git_clone():
     if git.returncode != 0:
         die('git clone failed, unable to continue')
 
+    if os.environ.get('GIT_REF', '') != '':
+        git_checkout()
+
 def git_checkout():
     logger.info("Performing git checkout")
     git_cmd = [
-        'git', 'checkout', os.environ['GIT_REF'],
-        git_dir
+        'git', 'checkout', os.environ['GIT_REF']
     ]
     git = subprocess.Popen(
         git_cmd,
         env = process_env,
-        cwd = git_dir,
+        cwd = run_dir + '/project',
         stderr = subprocess.STDOUT,
         stdout = subprocess.PIPE
     )
@@ -185,6 +191,7 @@ def init():
     """Initialization function before management loops."""
     init_nss_wrapper_passwd()
     init_logging()
+    init_namespace()
     check_env()
 
 def init_nss_wrapper_passwd():
@@ -201,23 +208,28 @@ def init_logging():
     """
     global logger
     logging.basicConfig(
-        format='%(asctime)-15s %(levelname)s - %(message)s',
+        format='%(levelname)s - %(message)s',
     )
     logger = logging.getLogger('runner')
     logger.setLevel(os.environ.get('LOGGING_LEVEL', 'INFO'))
+
+def init_namespace():
+    """
+    Set the namespace global based on the namespace in which this pod is
+    running.
+    """
+    global namespace
+    with open('/run/secrets/kubernetes.io/serviceaccount/namespace') as f:
+        namespace = f.read()
 
 def check_env():
     """Check environment for required variables."""
     if 'CALLBACK_URL' not in os.environ:
         die('Environment variable CALLBACK_URL not set'.format(env))
-            
+
 def main():
     """Main function."""
     init()
-    if os.environ.get('GIT_URL', ''):
-        git_clone()
-    if os.environ.get('GIT_REF', ''):
-        git_checkout()
     run_ansible()
     report_changes()
 

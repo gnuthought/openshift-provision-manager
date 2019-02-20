@@ -34,7 +34,6 @@ config_queue = None
 namespace = None
 pod_ip = socket.gethostbyname(os.environ['HOSTNAME'])
 provision_configs = {}
-runner_pods = {}
 default_retry_interval = os.environ.get('RETRY_INTERVAL', '10m')
 default_run_interval = os.environ.get('RUN_INTERVAL', '30m')
 kube_api = None
@@ -84,13 +83,22 @@ class ProvisionConfig:
         self.config_data = {}
         self.change_yaml = '# unknown'
         self.last_run_time = 0
+        self.lock = threading.RLock()
         self.name = name
         self.next_time_no_check_mode = False
         self.pod_name = None
         self.pod_running = False
-        self.retry_interval = default_retry_interval
-        self.run_interval = default_run_interval
         self.state = 'unknown'
+
+    def _lock(self):
+        logger.debug("Acquiring lock for {}".format(self.name))
+        self.lock.acquire()
+        logger.debug("Acquired lock for {}".format(self.name))
+
+    def _release(self):
+        logger.debug("Releasing lock for {}".format(self.name))
+        self.lock.release()
+        logger.debug("Released lock for {}".format(self.name))
 
     def provision(self):
         self.configmap_refresh()
@@ -113,6 +121,12 @@ class ProvisionConfig:
             self.next_time_no_check_mode = False
             return False
         return is_truthy(self.config_data.get('check_mode','no'))
+
+    def retry_interval(self):
+        return self.config_data.get('retry_interval', default_retry_interval)
+
+    def run_interval(self):
+        return self.config_data.get('run_interval', default_run_interval)
 
     def set_next_time_no_check_mode(self):
         self.next_time_no_check_mode = True
@@ -200,18 +214,31 @@ class ProvisionConfig:
                 )
             )
         if self.pod_name:
+            logger.debug("Removing previous runner {} for {}".format(
+                self.name,
+                self.pod_name
+            ))
             delete_runner_pod(self.pod_name)
-        self.pod_name = None
-        self.last_run_time = time.time()
-        self.start_runner_pod()
-        self.update_status_config_map()
 
-    def start_runner_pod(self):
+        self._lock()
+        try:
+            self.pod_name = None
+            self.last_run_time = time.time()
+            self._start_runner_pod()
+            self.update_status_config_map()
+        finally:
+            self._release()
+
+    def _start_runner_pod(self):
         check_mode = self.check_mode()
         pod_name = 'ansible-runner-{}-{}'.format(
             self.name,
             random_string(5)
         )
+        logger.debug("Starting runner {} for {}".format(
+            pod_name,
+            self.name
+        ))
         kube_api.create_namespaced_pod(
             namespace,
             kubernetes.client.V1Pod(
@@ -238,6 +265,10 @@ class ProvisionConfig:
                                 kubernetes.client.V1EnvVar(
                                     name = 'CHECK_MODE',
                                     value = 'true' if check_mode else 'false'
+                                ),
+                                kubernetes.client.V1EnvVar(
+                                    name = 'CONFIG_PATH',
+                                    value = self.config_data.get('config_path', '')
                                 ),
                                 kubernetes.client.V1EnvVar(
                                     name = 'GIT_REF',
@@ -269,9 +300,92 @@ class ProvisionConfig:
                 )
             )
         )
+        logger.debug("Runner {} started for {}".format(
+            pod_name,
+            self.name
+        ))
         self.pod_name = pod_name
-        runner_pods[pod_name] = self
         self.pod_running = True
+
+    def check_lost_runner_pod(self):
+        self._lock()
+        try:
+            if not self.pod_running \
+            or self.last_run_time > time.time() - 30:
+                return
+            self._check_lost_runner_pod()
+        finally:
+            self._release()
+
+    def _check_lost_runner_pod(self):
+        try:
+            pod = kube_api.read_namespaced_pod(
+                self.pod_name,
+                namespace
+            )
+            logger.debug("Runner pod {} for {} is {}".format(
+                self.pod_name,
+                self.name,
+                pod.status.phase
+            ))
+        except kubernetes.client.rest.ApiException as e:
+            if e.status == 404:
+                logger.warn("Provision config {} lost runner pod {}!".format(
+                    self.name,
+                    self.pod_name
+                ))
+                self.handle_run_lost()
+            else:
+                raise
+
+    def handle_runner_pod(self, pod):
+        self._lock()
+        try:
+            self._handle_runner_pod(pod)
+        finally:
+            self._release()
+
+    def _handle_runner_pod(self, pod):
+        if pod.metadata.deletion_timestamp:
+            logger.debug("Ignoring pod {} with deletion timestamp".format(
+                pod.metadata.name
+            ))
+        elif self.pod_name == None:
+            logger.warn("Recovered pod {} for {}".format(
+                pod.status.phase,
+                pod.metadata.name,
+                self.name
+            ))
+            self.pod_name = pod.metadata.name
+            if pod.status.phase in ('Pending', 'Running'):
+                self.pod_running = True
+        elif pod.metadata.name != self.pod_name:
+            logger.warn("Found unexpected {} pod {} for {}, deleting it".format(
+                pod.status.phase,
+                pod.metadata.name,
+                self.name
+            ))
+            delete_runner_pod(pod.metadata.name)
+        elif pod.status.phase in ('Failed', 'Unknown'):
+            logger.warn("Pod {} for {} found in {} state".format(
+                pod.metadata.name,
+                self.name,
+                pod.status.phase
+            ))
+            self.handle_run_failure()
+        elif pod.status.phase == 'Succeeded':
+            self.pod_running = False
+            logger.info("Pod {} for {} suceeeded".format(
+                pod.metadata.name,
+                self.name,
+                pod.status.phase
+            ))
+        else:
+            logger.debug("Handler observed runner {} for {} is {}".format(
+                pod.metadata.name,
+                self.name,
+                pod.status.phase
+            ))
 
     def handle_run_result(self, change_yaml):
         self.record_run_result(change_yaml)
@@ -297,6 +411,16 @@ class ProvisionConfig:
         self.state = 'failed'
         self.update_status_config_map()
 
+    def handle_run_lost(self):
+        self.record_run_lost()
+        self.queue_next_run()
+
+    def record_run_lost(self):
+        self.change_yaml = "# UNKNOWN"
+        self.pod_running = False
+        self.state = 'unknown'
+        self.update_status_config_map()
+
     def get_status_config_map(self):
         status_config_map = None
         try:
@@ -313,6 +437,8 @@ class ProvisionConfig:
         status_data = {
             'changes': self.change_yaml,
             'pod_running': 'true' if self.pod_running else 'false',
+            'retry_interval': self.retry_interval(),
+            'run_interval': self.run_interval(),
             'state': self.state
         }
         if self.pod_name:
@@ -331,7 +457,7 @@ class ProvisionConfig:
                     metadata = kubernetes.client.V1ObjectMeta(
                         name = self.name + '-status',
                         labels = {
-                            "openshift-provision.gnuthought.com/status": "true"
+                            'openshift-provision.gnuthought.com/status': 'true'
                         }
                     ),
                     data = status_data
@@ -339,10 +465,10 @@ class ProvisionConfig:
             )
 
     def queue_next_run(self):
-        if self.state == 'failed':
-            config_queue.push(self.name, self.retry_interval)
+        if self.state in ['failed', 'unknown']:
+            config_queue.push(self.name, self.retry_interval())
         else:
-            config_queue.push(self.name, self.run_interval)
+            config_queue.push(self.name, self.run_interval())
 
 class ConfigQueue:
     """
@@ -398,8 +524,11 @@ class ConfigQueue:
         name = None
         for i in range(len(self.queue)):
              config = provision_configs[self.queue[i]]
-             if not config.pod_running:
+             if config.pod_running:
+                 logger.debug("Queue not releasing {}, still running".format(config.name))
+             else:
                  name = self.queue.pop(i)
+                 logger.debug("Queue releasing {}".format(name))
                  break
         self.lock.release()
         return name
@@ -419,6 +548,7 @@ def init():
     init_provision_configs()
     init_runner_pods()
     init_queueing()
+    logger.debug("Completed init")
 
 def init_kube_api():
     """Set kube_api global to communicate with the local kubernetes cluster."""
@@ -500,41 +630,7 @@ def handle_runner_pod(pod):
         ))
         delete_runner_pod(pod.metadata.name)
     else:
-        config = provision_configs[config_name]
-        if pod.metadata.deletion_timestamp:
-            logger.debug("Ignoring pod {} with deletion timestamp".format(
-                pod.metadata.name
-            ))
-        elif config.pod_name == None:
-            logger.info("Recording that {} pod {} belongs to {}".format(
-                pod.status.phase,
-                pod.metadata.name,
-                config_name
-            ))
-            config.pod_name = pod.metadata.name
-            if pod.status.phase in ('Pending', 'Running'):
-                config.pod_running = True
-        elif pod.metadata.name != config.pod_name:
-            logger.warn("Found unexpected {} pod {} for {}, deleting it".format(
-                pod.status.phase,
-                pod.metadata.name,
-                config_name
-            ))
-            delete_runner_pod(pod.metadata.name)
-        elif pod.status.phase in ('Failed', 'Unknown'):
-            logger.warn("Pod {} for {} found in {} state".format(
-                pod.metadata.name,
-                config_name,
-                pod.status.phase
-            ))
-            config.handle_run_failure()
-        elif pod.status.phase == 'Succeeded':
-            config.pod_running = False
-            logger.info("Pod {} for {} suceeeded".format(
-                pod.metadata.name,
-                config_name,
-                pod.status.phase
-            ))
+        provision_configs[config_name].handle_runner_pod(pod)
 
 def signal_provision_start():
     """
@@ -572,7 +668,7 @@ def provision_config(config):
             config.name,
             str(e)
         ))
-        config_queue.push(config.name, delay=config.retry_interval)
+        config_queue.push(config.name, delay=config.retry_interval())
         time.sleep(60)
 
 def provision_config_queue():
@@ -595,8 +691,8 @@ def handle_lost_runner_pods():
 
     This handles the case of a runner pod being manually deleted.
     '''
-    # FIXME
-    pass
+    for provision_config in provision_configs.values():
+        provision_config.check_lost_runner_pod()
 
 def provision_loop():
     while True:
@@ -641,6 +737,10 @@ def watch_config_maps():
         label_selector = "openshift-provision.gnuthought.com/config=true"
     ):
         config_map = event['object']
+        logger.debug("Watch saw {} configmap {}".format(
+            event['type'],
+            config_map.metadata.name
+        ))
         if event['type'] in ('ADDED','MODIFIED'):
             if config_map.metadata.deletion_timestamp:
                 remove_config(config_map.metadata.name)
@@ -659,20 +759,29 @@ def watch_config_maps_loop():
 
 def delete_runner_pod(pod_name):
     logger.debug('Deleting pod ' + pod_name)
-    kube_api.delete_namespaced_pod(
-        pod_name,
-        namespace,
-        {}
-    )
+    try:
+        kube_api.delete_namespaced_pod(
+            pod_name,
+            namespace,
+            {}
+        )
+    except kubernetes.client.rest.ApiException as e:
+        if e.status != 404:
+            raise
 
 def watch_pods():
+    logger.debug('Starting watch for runner pods')
     w = kubernetes.watch.Watch()
     for event in w.stream(
         kube_api.list_namespaced_pod,
         namespace,
-        label_selector = "openshift-provision.gnuthought.com/runner=true"
+        label_selector = 'openshift-provision.gnuthought.com/runner=true'
     ):
         pod = event['object']
+        logger.debug("Watch saw {} pod {}".format(
+            event['type'],
+            pod.metadata.name
+        ))
         if event['type'] in ('ADDED','MODIFIED'):
             handle_runner_pod(pod)
 

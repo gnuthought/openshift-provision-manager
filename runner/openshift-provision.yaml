@@ -6,18 +6,20 @@
 
   pre_tasks:
 
+  - debug: var=openshift_provision_config_path
+
   - name: Load vars files from openshift_provision_config_path
     include_vars:
-      file: "{{ openshift_provision_config_path }}"
+      file: "{{ item }}"
     # Load in reverse order so earlier path items override later ones
-    with_items: "{{ openshift_provision_config_path.split(':')[::-1] }}"
+    with_items: "{{ openshift_provision_config_path[::-1] }}"
     when: item is file
 
   - name: Load vars directories from openshift_provision_config_path
     include_vars:
       dir: "{{ item }}"
       files_matching: 'main\.(json|ya?ml)$'
-    with_items: "{{ openshift_provision_config_path.split()[::-1] }}"
+    with_items: "{{ openshift_provision_config_path[::-1] }}"
     when: item is directory
 
   - name: Load vars in openshift_provision_config_hierarchy
@@ -26,8 +28,6 @@
       files_matching: '[a-z0-9].*\.(json|ya?ml)$'
     with_items: >-
       {{ (openshift_provision_config_hierarchy|default([]))[::-1] }}
-    vars:
-      vars_path: "{{ openshift_provision_config_path }}/{{ item }}/vars"
     when: vars_path is directory
 
   - name: Set openshift_provision_resource_path by openshift_provision_config_hierarchy

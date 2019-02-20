@@ -18,7 +18,7 @@ parameters:
 - name: MANAGER_IMAGE
   value: openshift-provision-manager:latest
 - name: RUNNER_IMAGE
-  value: openshift-provision-manager:latest
+  value: openshift-provision-runner:latest
 
 objects:
 - apiVersion: project.openshift.io/v1
@@ -75,6 +75,7 @@ objects:
   kind: Route
   metadata:
     name: ${MANAGER_SERVICE_NAME}
+    namespace: ${OPENSHIFT_PROVISION_NAMESPACE}
   spec:
     port:
       targetPort: api

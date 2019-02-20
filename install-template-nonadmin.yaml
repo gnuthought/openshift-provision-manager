@@ -18,7 +18,7 @@ parameters:
 - name: MANAGER_IMAGE
   value: openshift-provision-manager:latest
 - name: RUNNER_IMAGE
-  value: openshift-provision-manager:latest
+  value: openshift-provision-runner:latest
 
 objects:
 - apiVersion: v1
