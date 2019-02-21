@@ -20,7 +20,7 @@ role, this containerized deployment adds:
   divergence and configurable convergence
 
 * **Immediate** - responsive to changes in managed resources (feature in
-  project resources)
+  project roadmap)
 
 ## Examples
 
