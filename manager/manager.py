@@ -15,6 +15,7 @@ import sys
 import string
 import threading
 import time
+import yaml
 
 api = flask.Flask('rest')
 
@@ -22,36 +23,80 @@ stat_config_state = prometheus_client.Enum(
     'config_state',
     'Configuration state',
     ['name'],
-    states=['unknown','provisioned','changed','failed','removed']
+    states=[
+        'unknown',
+        'provisioned',
+        'changed',
+        'check-failed',
+        'removed',
+        'invalid'
+    ]
 )
-stat_webhook_call_count = prometheus_client.Counter(
-    'webhook_call_count',
-    'Number of webhook calls',
-    ['name']
+stat_run_state = prometheus_client.Enum(
+    'runner_state',
+    'Runner state',
+    ['name'],
+    states=[
+        'new',
+        'config-updated',
+        'running',
+        'received-callback',
+        'succeeded',
+        'failed',
+        'triggered',
+        'disabled'
+    ]
 )
 
-config_queue = None
-namespace = None
+runnable_states = ('new','config-updated','succeeded','failed','triggered')
+
 pod_ip = socket.gethostbyname(os.environ['HOSTNAME'])
-provision_configs = {}
-default_retry_interval = os.environ.get('RETRY_INTERVAL', '10m')
-default_run_interval = os.environ.get('RUN_INTERVAL', '30m')
+
+# Variables initialized during init()
+namespace = None
 kube_api = None
 logger = None
-provision_start_release = threading.Lock()
+service_account_token = None
+
+# Delay from initial config appears to first run. Allows for time for service
+# account token creation for runner pod.
+default_initial_delay = os.environ.get('INITIAL_DELAY', '5s')
+
+# Delay for next run after change or check-failed
+default_recheck_interval = os.environ.get('RECHECK_INTERVAL', '5m')
+
+# Delay for retry after a failed run
+default_retry_interval = os.environ.get('RETRY_INTERVAL', '10m')
+
+# Delay for next run after succesful run
+default_run_interval = os.environ.get('RUN_INTERVAL', '30m')
+
+# Delay for next run after succesful run
+default_run_timeout = os.environ.get('RUN_TIMEOUT', '30m')
+
+# Global list of known provision configurations
+provision_configs = {}
+
+# Interval to check configurations for which are ready to run
+poll_interval = os.environ.get('POLL_INTERVAL', '10s')
+
+# Lock used by webhook to trigger immediate run
+polling_release_lock = threading.Lock()
+
+# Container image to use for openshift-ansible runner
 runner_image = os.environ.get(
     'RUNNER_IMAGE',
     'docker.io/gnuthought/openshift-provision-runner:latest'
 )
-service_account_token = None
 
 class ProvisionConfigInvalidError(Exception):
     pass
+
 class ProvisionConfigRemovedError(Exception):
     pass
 
 def is_truthy(s):
-    return s in ['yes', 'Yes', 'true', 'True']
+    return s in ('yes', 'Yes', 'true', 'True')
 
 def random_string(n):
     return ''.join(
@@ -78,103 +123,145 @@ def time_to_sec(t):
     else:
         return int(m.group(1))
 
+def polling_release():
+    """
+    Signal provision loop that there is work to be done
+
+    This is done by releasing the provision_start_release lock. This
+    lock may be already released.
+    """
+    try:
+        polling_release_lock.release()
+    except threading.ThreadError:
+        pass
+
+def delete_pod(pod_name):
+    logger.debug('Deleting pod ' + pod_name)
+    try:
+        kube_api.delete_namespaced_pod(
+            pod_name,
+            namespace,
+            {}
+        )
+    except kubernetes.client.rest.ApiException as e:
+        if e.status != 404:
+            raise
+
 class ProvisionConfig:
-    def __init__(self, name):
-        self.config_data = {}
-        self.change_yaml = '# unknown'
-        self.last_run_time = 0
+    def __init__(self, config_map):
         self.lock = threading.RLock()
-        self.name = name
-        self.next_time_no_check_mode = False
+        self.callback_key = random_string(16)
+        self.config_data = config_map.data
+        self.change_yaml = None
+        self.last_start_time = 0
+        self.last_end_time = 0
+        self.name = config_map.metadata.name
+        self.next_run_no_check_mode = False
+        self.next_config_state = None
+        self.next_run_state = None
         self.pod_name = None
-        self.pod_running = False
-        self.state = 'unknown'
+        self.previous_pod_name = None
+        self.config_state = None
+        self.run_state = 'new'
+        self.running_check_mode = False
+
+        self._lock()
+        try:
+            self._set_config_state('unknown')
+            self._set_run_state('new')
+        finally:
+            self._release()
 
     def _lock(self):
-        logger.debug("Acquiring lock for {}".format(self.name))
         self.lock.acquire()
-        logger.debug("Acquired lock for {}".format(self.name))
 
     def _release(self):
-        logger.debug("Releasing lock for {}".format(self.name))
         self.lock.release()
-        logger.debug("Released lock for {}".format(self.name))
 
-    def provision(self):
-        self.configmap_refresh()
-        self.start_run()
+    def initial_delay(self):
+        return time_to_sec(
+            self.config_data.get('initial_delay', default_initial_delay)
+        )
 
-    def configmap_refresh(self):
-        try:
-            self.config_data = kube_api.read_namespaced_config_map(
-                self.name,
-                namespace
-            ).data
-        except kubernetes.client.rest.ApiException as e:
-            if e.status == 404:
-                raise ProvisionConfigRemovedError
+    def _set_config_state(self, state):
+        stat_config_state.labels(self.name).state(state)
+        self.config_state = state
+        if state in ('unknown','config-removed','config-invalid'):
+            self.change_yaml = '# ' + state
+        self.update_status_config_map()
+
+    def _set_run_state(self, state):
+        stat_run_state.labels(self.name).state(state)
+        self.run_state = state
+        if self.is_runnable():
+            self._set_next_start_time()
+
+    def _set_state_transition(self, run_state=None, config_state=None):
+        '''Set next state or immediate state as appropriate'''
+        if self.run_state in ('running', 'received-callback'):
+            self.next_config_state = config_state
+            self.next_run_state = run_state
+        else:
+            self._set_config_state(config_state)
+            self._set_run_state(run_state)
+
+    def _set_next_start_time(self):
+        if self.run_state in ('triggered'):
+            delay = 0
+        elif self.run_state in ('new', 'config-updated'):
+            delay = self.initial_delay()
+        elif self.run_state in ('succeeded'):
+            if self.config_state in ('provisioned'):
+                delay = self.run_delay()
             else:
-                raise
+                delay = self.recheck_delay()
+        else:
+            delay = self.retry_delay()
+        self.next_start_time = time.time() + delay
+
+    def poll(self):
+        self.check_start_run()
+        self.check_run_timeout()
+
+    def is_runnable(self):
+        return self.run_state in runnable_states
+
+    def recheck_delay(self):
+        return time_to_sec(
+            self.config_data.get('recheck_interval', default_recheck_interval)
+        )
+
+    def retry_delay(self):
+        return time_to_sec(
+            self.config_data.get('retry_interval', default_retry_interval)
+        )
+
+    def run_delay(self):
+        return time_to_sec(
+            self.config_data.get('run_interval', default_run_interval)
+        )
+
+    def run_timeout(self):
+        return time_to_sec(
+            self.config_data.get('run_timeout', default_run_timeout)
+        )
 
     def check_mode(self):
-        if self.next_time_no_check_mode:
-            self.next_time_no_check_mode = False
+        if self.next_run_no_check_mode:
+            self.next_run_no_check_mode = False
             return False
-        return is_truthy(self.config_data.get('check_mode','no'))
-
-    def retry_interval(self):
-        return self.config_data.get('retry_interval', default_retry_interval)
-
-    def run_interval(self):
-        return self.config_data.get('run_interval', default_run_interval)
-
-    def set_next_time_no_check_mode(self):
-        self.next_time_no_check_mode = True
+        return is_truthy( self.config_data.get('check_mode','no') )
 
     def service_account(self):
-        if 'service_account' in self.config_data:
-            return self.config_data['service_account']
-        return self.name
+        return self.config_data.get('service_account', self.name)
 
     def callback_url(self):
         '''Return URL for runner pod callback'''
         return 'http://{}:5000/callback/{}/{}'.format(
             pod_ip,
             self.name,
-            self.callback_key()
+            self.callback_key
         )
-
-    def callback_key(self):
-        '''Get callback key value or generate value if needed'''
-        if 'callback_key' in self.config_data:
-            return self.config_data['callback_key']
-        else:
-            callback_secret = self.config_data.get(
-                'callback_secret',
-                self.name + '-callback'
-            )
-            try:
-                secret = kube_api.read_namespaced_secret(
-                    callback_secret,
-                    namespace
-                )
-                return base64.b64decode(secret.data['key'])
-            except kubernetes.client.rest.ApiException as e:
-                if e.status != 404:
-                    raise
-            return_key = random_string(16)
-            kube_api.create_namespaced_secret(
-                namespace,
-                kubernetes.client.V1Secret(
-                    metadata = kubernetes.client.V1ObjectMeta(
-                        name = callback_secret
-                    ),
-                    data = {
-                        'key': base64.b64encode(return_key)
-                    }
-                )
-            )
-            return return_key
 
     def webhook_key(self):
         '''Get webhook key value from config or secret'''
@@ -196,6 +283,15 @@ class ProvisionConfig:
                     raise
             return None
 
+    def webhook_triggered(self, no_check_mode=False):
+        self._lock()
+        try:
+            if no_check_mode:
+                self.next_run_no_check_mode = True
+            self._set_state_transition(run_state='triggered')
+        finally:
+            self._release()
+
     def ansible_vars(self):
         return self.config_data.get('vars', '{}')
 
@@ -205,45 +301,86 @@ class ProvisionConfig:
     def git_ref(self):
         return self.config_data.get('git_ref', 'master')
 
-    def start_run(self):
-        if self.pod_running:
-            raise Exception(
-                '{} in start_run when pod {} is thought to be running'.format(
-                    self.name,
-                    self.pod_name
+    def get_status_config_map(self):
+        status_config_map = None
+        try:
+            status_config_map = kube_api.read_namespaced_config_map(
+                self.name + '-status',
+                namespace
+            ).data
+        except kubernetes.client.rest.ApiException as e:
+            if e.status != 404:
+                raise
+        return status_config_map
+
+    def update_status_config_map(self):
+        status_data = {
+            'change_record': self.change_yaml,
+            'config_state': self.config_state
+        }
+        if self.pod_name:
+            status_data['pod_name'] = self.pod_name
+
+        if self.get_status_config_map():
+            kube_api.patch_namespaced_config_map(
+                self.name + '-status',
+                namespace,
+                { "data": status_data }
+            )
+        else:
+            kube_api.create_namespaced_config_map(
+                namespace,
+                kubernetes.client.V1ConfigMap(
+                    metadata = kubernetes.client.V1ObjectMeta(
+                        name = self.name + '-status',
+                        labels = {
+                            'openshift-provision.gnuthought.com/status': 'true'
+                        }
+                    ),
+                    data = status_data
                 )
             )
-        if self.pod_name:
-            logger.debug("Removing previous runner {} for {}".format(
-                self.name,
-                self.pod_name
-            ))
-            delete_runner_pod(self.pod_name)
 
+    def _delete_previous_runner_pod(self):
+        '''Delete runner pod if it exists'''
+        if self.previous_pod_name:
+            logger.debug('Deleting previous runner pod {} for {}'.format(
+                self.previous_pod_name, self.name
+            ))
+            delete_pod(self.previous_pod_name)
+            self.previous_pod_name = None
+
+    def check_start_run(self):
         self._lock()
         try:
-            self.pod_name = None
-            self.last_run_time = time.time()
-            self._start_runner_pod()
-            self.update_status_config_map()
+            if self.is_runnable() \
+            and time.time() >= self.next_start_time:
+                self.previous_pod_name = self.pod_name
+                self._start_run()
+        except Exception as e:
+            logger.error("Failed to start run for {}".format(self.name))
+            self._set_run_state('failed')
+            raise
         finally:
             self._release()
 
+    def _start_run(self):
+        self.pod_name = None
+        self._set_run_state('running')
+        self._delete_previous_runner_pod()
+        self._start_runner_pod()
+        self.update_status_config_map()
+
     def _start_runner_pod(self):
-        check_mode = self.check_mode()
-        pod_name = 'ansible-runner-{}-{}'.format(
-            self.name,
-            random_string(5)
-        )
-        logger.debug("Starting runner {} for {}".format(
-            pod_name,
-            self.name
-        ))
+        self.running_check_mode = self.check_mode()
+        self.last_start_time = time.time()
+        self.pod_name = 'ansible-runner-{}-{}'.format(self.name, random_string(5))
+        logger.debug("Starting runner {} for {}".format(self.pod_name, self.name))
         kube_api.create_namespaced_pod(
             namespace,
             kubernetes.client.V1Pod(
                 metadata = kubernetes.client.V1ObjectMeta(
-                    name = pod_name,
+                    name = self.pod_name,
                     labels = {
                         'openshift-provision.gnuthought.com/configmap': self.name,
                         'openshift-provision.gnuthought.com/runner': 'true'
@@ -264,7 +401,7 @@ class ProvisionConfig:
                                 ),
                                 kubernetes.client.V1EnvVar(
                                     name = 'CHECK_MODE',
-                                    value = 'true' if check_mode else 'false'
+                                    value = 'true' if self.running_check_mode else 'false'
                                 ),
                                 kubernetes.client.V1EnvVar(
                                     name = 'CONFIG_PATH',
@@ -300,244 +437,162 @@ class ProvisionConfig:
                 )
             )
         )
-        logger.debug("Runner {} started for {}".format(
-            pod_name,
-            self.name
-        ))
-        self.pod_name = pod_name
-        self.pod_running = True
 
-    def check_lost_runner_pod(self):
+    def handle_runner_pod_event(self, event_type, pod):
         self._lock()
         try:
-            if not self.pod_running \
-            or self.last_run_time > time.time() - 30:
-                return
-            self._check_lost_runner_pod()
+            self._handle_runner_pod_event(event_type, pod)
         finally:
             self._release()
 
-    def _check_lost_runner_pod(self):
-        try:
-            pod = kube_api.read_namespaced_pod(
-                self.pod_name,
-                namespace
-            )
-            logger.debug("Runner pod {} for {} is {}".format(
-                self.pod_name,
-                self.name,
-                pod.status.phase
-            ))
-        except kubernetes.client.rest.ApiException as e:
-            if e.status == 404:
-                logger.warn("Provision config {} lost runner pod {}!".format(
-                    self.name,
-                    self.pod_name
-                ))
-                self.handle_run_lost()
-            else:
-                raise
-
-    def handle_runner_pod(self, pod):
-        self._lock()
-        try:
-            self._handle_runner_pod(pod)
-        finally:
-            self._release()
-
-    def _handle_runner_pod(self, pod):
-        if pod.metadata.deletion_timestamp:
-            logger.debug("Ignoring pod {} with deletion timestamp".format(
-                pod.metadata.name
-            ))
-        elif self.pod_name == None:
-            logger.warn("Recovered pod {} for {}".format(
-                pod.status.phase,
-                pod.metadata.name,
-                self.name
-            ))
-            self.pod_name = pod.metadata.name
-            if pod.status.phase in ('Pending', 'Running'):
-                self.pod_running = True
-        elif pod.metadata.name != self.pod_name:
-            logger.warn("Found unexpected {} pod {} for {}, deleting it".format(
-                pod.status.phase,
-                pod.metadata.name,
-                self.name
-            ))
-            delete_runner_pod(pod.metadata.name)
-        elif pod.status.phase in ('Failed', 'Unknown'):
-            logger.warn("Pod {} for {} found in {} state".format(
-                pod.metadata.name,
-                self.name,
-                pod.status.phase
-            ))
-            self.handle_run_failure()
-        elif pod.status.phase == 'Succeeded':
-            self.pod_running = False
-            logger.info("Pod {} for {} suceeeded".format(
-                pod.metadata.name,
-                self.name,
-                pod.status.phase
-            ))
-        else:
-            logger.debug("Handler observed runner {} for {} is {}".format(
-                pod.metadata.name,
-                self.name,
-                pod.status.phase
-            ))
-
-    def handle_run_result(self, change_yaml):
-        self.record_run_result(change_yaml)
-        self.queue_next_run()
-
-    def record_run_result(self, change_yaml):
-        self.change_yaml = change_yaml
-        if '---' in change_yaml:
-            # Changed if there are change records in the yaml document
-            self.state = 'changed'
-        else:
-            self.state = 'provisioned'
-        stat_config_state.labels(self.name).state(self.state)
-        self.update_status_config_map()
-
-    def handle_run_failure(self):
-        self.record_run_failure()
-        self.queue_next_run()
-
-    def record_run_failure(self):
-        self.change_yaml = "# FAILED"
-        self.pod_running = False
-        self.state = 'failed'
-        self.update_status_config_map()
-
-    def handle_run_lost(self):
-        self.record_run_lost()
-        self.queue_next_run()
-
-    def record_run_lost(self):
-        self.change_yaml = "# UNKNOWN"
-        self.pod_running = False
-        self.state = 'unknown'
-        self.update_status_config_map()
-
-    def get_status_config_map(self):
-        status_config_map = None
-        try:
-            status_config_map = kube_api.read_namespaced_config_map(
-                self.name + '-status',
-                namespace
-            ).data
-        except kubernetes.client.rest.ApiException as e:
-            if e.status != 404:
-                raise
-        return status_config_map
-
-    def update_status_config_map(self):
-        status_data = {
-            'changes': self.change_yaml,
-            'pod_running': 'true' if self.pod_running else 'false',
-            'retry_interval': self.retry_interval(),
-            'run_interval': self.run_interval(),
-            'state': self.state
-        }
-        if self.pod_name:
-            status_data['pod_name'] = self.pod_name
-
-        if self.get_status_config_map():
-            kube_api.patch_namespaced_config_map(
-                self.name + '-status',
-                namespace,
-                { "data": status_data }
-            )
-        else:
-            kube_api.create_namespaced_config_map(
-                namespace,
-                kubernetes.client.V1ConfigMap(
-                    metadata = kubernetes.client.V1ObjectMeta(
-                        name = self.name + '-status',
-                        labels = {
-                            'openshift-provision.gnuthought.com/status': 'true'
-                        }
-                    ),
-                    data = status_data
-                )
-            )
-
-    def queue_next_run(self):
-        if self.state in ['failed', 'unknown']:
-            config_queue.push(self.name, self.retry_interval())
-        else:
-            config_queue.push(self.name, self.run_interval())
-
-class ConfigQueue:
-    """
-    A class to safely manage the config queue. The desired queue behavior has
-    features of both a set and a fifo queue such that duplication is prevented
-    while also implementing first-in, first-out behavior.
-    """
-    def __init__(self):
-        self.queue = []
-        self.delay_queue = {}
-        self.lock = threading.RLock()
-    def _process_delay_queue(self):
-        for name, delay_until in self.delay_queue.items():
-            if delay_until <= time.time():
-                logger.debug("Moving {} from delay queue".format(name))
-                self.queue.append(name)
-                del self.delay_queue[name]
-    def _insert_into_delay_queue(self, name, delay):
-        """Add to delay queue if not present in immediate queue"""
-        if name in self.queue or name in self.delay_queue:
-            logger.debug("Not delay queueing {}, already queued".format(name))
+    def _handle_runner_pod_event(self, event_type, pod):
+        if self.pod_name != pod.metadata.name:
             return
-        logger.debug("Inserting {} into delay queue".format(name))
-        self.delay_queue[name] = time.time() + time_to_sec(delay)
-    def _insert_into_queue(self, name):
-        """Add to immediate queue if not present"""
-        self._remove_from_delay_queue(name)
-        if name in self.queue:
-            logger.debug("Not queueing {}, already queued".format(name))
-        else:
-            logger.debug("Inserting {} into queue".format(name))
-            self.queue.insert(0, name)
-    def _remove_from_delay_queue(self, name):
-        """Remove config from delay queue if present"""
-        if name in self.delay_queue:
-            del self.delay_queue[name]
-    def _remove_from_queue(self, name):
-        """Remove config from queue if present"""
-        self.queue = [n for n in self.queue if n != name]
-    def push(self, name, delay=None):
-        self.lock.acquire()
-        self._process_delay_queue()
-        if delay:
-            self._insert_into_delay_queue(name, delay)
-        else:
-            self._insert_into_queue(name)
-        self.lock.release()
-        signal_provision_start()
-    def pop(self):
-        name = None
-        self.lock.acquire()
-        self._process_delay_queue()
-        name = None
-        for i in range(len(self.queue)):
-             config = provision_configs[self.queue[i]]
-             if config.pod_running:
-                 logger.debug("Queue not releasing {}, still running".format(config.name))
-             else:
-                 name = self.queue.pop(i)
-                 logger.debug("Queue releasing {}".format(name))
-                 break
-        self.lock.release()
-        return name
-    def remove(self, name):
-        """Remove config name from queue"""
-        self.lock.acquire()
-        self._remove_from_delay_queue(name)
-        self._remove_from_queue(name)
-        self.lock.release()
+        elif event_type == 'DELETED':
+            self._handle_runner_deleted(pod)
+        elif event_type in ('ADDED','MODIFIED') \
+        and not pod.metadata.deletion_timestamp:
+            if pod.status.phase == 'Succeeded':
+                self._handle_runner_succeeded()
+            elif pod.status.phase == 'Failed':
+                self._handle_runner_failed()
+            else:
+                logger.debug("Runner pod {} for {} is {}".format(
+                    self.pod_name, self.name, pod.status.phase
+                ))
+
+    def _handle_runner_deleted(self, pod):
+        self.pod_name = None
+        logger.error("Runner pod {} for {} deleted unexpectedly from run state {}".format(
+            pod.metadata.name, self.name, self.run_state
+        ))
+        if self.run_state == 'running':
+            self._transition_to_next_state(run_state='failed', config_state='unknown')
+
+    def _handle_runner_succeeded(self):
+        if self.run_state == 'succeeded':
+            return
+        elif self.run_state != 'received-callback':
+            logger.error("Runner for {} succeeded from state {} != 'received-callback'?!".format(
+                self.name, self.run_state
+            ))
+        self._transition_to_next_state(run_state='succeeded')
+
+    def _handle_runner_failed(self):
+        if self.run_state == 'failed':
+            return
+        if self.run_state != 'running':
+            logger.error("Runner for {} succeeded from state {} != 'running'?!".format(
+                self.name, self.run_state
+            ))
+        self._transition_to_next_state(run_state='failed', config_state='unknown')
+
+    def _transition_to_next_state(self, run_state=None, config_state=None):
+        '''
+        Transition to next state or to state specified.
+
+        Called when runner pod completes with succes or failure to transition
+        to the next state, either handling the run result or moving to state
+        set by config change or trigger.
+        '''
+        if self.next_run_state:
+            self._set_run_state(next_run_state)
+            self.next_run_state = None
+        elif run_state:
+            self._set_run_state(run_state)
+
+        if self.next_config_state:
+            self._set_config_state(self.next_config_state)
+            self.next_config_state = None
+        elif config_state:
+            self._set_config_state(config_state)
+
+    def handle_config_map_update(self, config_map):
+        self._lock()
+        try:
+            set_config_state_value = 'unknown'
+            set_run_state_value = 'config-updated'
+            self.config_data = config_map.data
+            self.sanity_check()
+        except ProvisionConfigInvalidError as e:
+            logger.error("Config {} failed sanity check: {}".format(
+                self.name, e
+            ))
+            set_config_state_value = 'invalid'
+            set_run_state_value = 'disabled'
+        finally:
+            try:
+                self._set_state_transition(
+                    run_state=set_run_state_value,
+                    config_state=set_config_state_value
+                )
+            finally:
+                self._release()
+
+    def handle_config_map_removed(self):
+        self._lock()
+        try:
+            self._set_state_transition(self, run_state='removed', config_state='disabled')
+        finally:
+            self._release()
+
+    def sanity_check(self):
+        for time_field in (
+            'initial_delay','recheck_interval','retry_interval','run_interval','run_timeout'
+        ):
+            if time_field in self.config_data \
+            and not re.match(r'\d+[hms]?$', self.config_data[time_field]):
+                raise ProvisionConfigInvalidError('Invalid time value for {}: {}'.format(
+                    time_field, e
+                ))
+
+            if 'check_mode' in self.config_data \
+            and self.config_data['check_mode'] not in (
+                'Yes', 'yes', 'true', 'True',
+                'No', 'no', 'false', 'False'
+            ):
+                raise ProvisionConfigInvalidError('Invalid value for check_mode: {}'.format(
+                    self.config_data['check_mode']
+                ))
+
+            if 'vars' in self.config_data:
+                try:
+                    yaml.load(self.config_data['vars'])
+                except yaml.parser.ParserError as e:
+                    raise ProvisionConfigInvalidError('Invalid value for vars: {}'.format(e))
+
+    def check_run_timeout(self):
+        self._lock()
+        try:
+            if self.run_state in ('running', 'received-callback') \
+            and time.time() > self.last_start_time + self.run_timeout():
+                logger.debug('Timeout waiting on runner pod {} for {}'.format(
+                    self.pod_name, self.name
+                ))
+                self.previous_pod_name = self.pod_name
+                self.pod_name = None
+                self._delete_previous_runner_pod()
+                self._transition_to_next_state(run_state='failed', config_state='unknown')
+        finally:
+            self._release()
+
+    def handle_callback_data(self, change_yaml):
+        self._lock()
+        try:
+            if self.run_state == 'running':
+                self.change_yaml = change_yaml
+                if '---' in change_yaml:
+                    # Changed if there are change records in the yaml document
+                    self._set_config_state('check-failed' if self.running_check_mode else 'changed')
+                else:
+                    self._set_config_state('provisioned')
+                self._set_run_state('received-callback')
+            else:
+                logger.error("Received callback for {} while in state {}".format(
+                    self.name, self.run_state
+                ))
+        finally:
+            self._release()
 
 def init():
     """Initialization function before management loops."""
@@ -545,9 +600,7 @@ def init():
     init_namespace()
     init_service_account_token()
     init_kube_api()
-    init_provision_configs()
-    init_runner_pods()
-    init_queueing()
+    init_cleanup_runner_pods()
     logger.debug("Completed init")
 
 def init_kube_api():
@@ -583,28 +636,12 @@ def init_namespace():
     with open('/run/secrets/kubernetes.io/serviceaccount/namespace') as f:
         namespace = f.read()
 
-def init_queueing():
-    global config_queue
-    config_queue = ConfigQueue()
-    provision_start_release.acquire()
-
 def init_service_account_token():
     global service_account_token
     with open('/run/secrets/kubernetes.io/serviceaccount/token') as f:
         service_account_token = f.read()
 
-def init_provision_configs():
-    '''
-    Get list of configmaps and set provision_configs without triggering
-    processing.
-    '''
-    for config_map in kube_api.list_namespaced_config_map(
-        namespace,
-        label_selector = "openshift-provision.gnuthought.com/config=true"
-    ).items:
-        add_config(config_map.metadata.name)
-
-def init_runner_pods():
+def init_cleanup_runner_pods():
     '''
     Cleanup any old stopped pods and add record of any running pods.
     '''
@@ -612,122 +649,49 @@ def init_runner_pods():
         namespace,
         label_selector = "openshift-provision.gnuthought.com/runner=true"
     ).items:
-        handle_runner_pod(pod)
+        delete_pod(pod.metadata.name)
 
-def handle_runner_pod(pod):
-    config_name = pod.metadata.labels.get(
-        'openshift-provision.gnuthought.com/configmap',
-        None
-    )
-    if config_name == None:
-        logger.warn("Ignoring runner pod {} without configmap label".format(
-            pod.metadata.name
-        ))
-    elif config_name not in provision_configs:
-        logger.warn("Deleting runner pod {} with unknown configmap: {}".format(
-            pod.metadata.name,
-            config_name
-        ))
-        delete_runner_pod(pod.metadata.name)
-    else:
-        provision_configs[config_name].handle_runner_pod(pod)
+def poll_provision_configs():
+    '''Call poll on each provision config'''
+    for config in provision_configs.values():
+        config.poll()
 
-def signal_provision_start():
-    """
-    Signal provision loop that there is work to be done
-
-    This is done by releasing the provision_start_release lock. This
-    lock may be already released.
-    """
-    logger.debug("Signaling provision start")
-    try:
-        provision_start_release.release()
-    except threading.ThreadError:
-        pass
-
-def provision_config(config):
-    """
-    Run openshift-provision for config
-    """
-    try:
-        config.provision()
-    except ProvisionConfigRemovedError:
-        # ConfigMap was deleted, remove from processing
-        logger.info("Removing deleted provisioning config {}".format(
-            config.name
-        ))
-        del provision_configs[config.name]
-    except ProvisionConfigInvalidError as e:
-        logger.info("Removing invalid provisioning config {}: {}".format(
-            config.name,
-            str(e)
-        ))
-        del provision_configs[config.name]
-    except Exception as e:
-        logger.exception("Error in provision {}: {}".format(
-            config.name,
-            str(e)
-        ))
-        config_queue.push(config.name, delay=config.retry_interval())
-        time.sleep(60)
-
-def provision_config_queue():
-    """
-    Process all pending provisioning on config queue
-    """
-    logger.debug("Processing queue")
-    config_name = config_queue.pop()
-    while config_name:
-        logger.info("Provisioning " + config_name)
-        config = provision_configs.get(config_name, None)
-        if config:
-            provision_config(config)
-        config_name = config_queue.pop()
-
-def handle_lost_runner_pods():
-    '''
-    Loop through provision configs and check for pods that have been
-    lost though the current state shows they should be running.
-
-    This handles the case of a runner pod being manually deleted.
-    '''
-    for provision_config in provision_configs.values():
-        provision_config.check_lost_runner_pod()
-
-def provision_loop():
+def poll_provision_loop():
     while True:
         try:
-            provision_start_release.acquire()
-            provision_config_queue()
-            handle_lost_runner_pods()
+            polling_release_lock.acquire()
+            poll_provision_configs()
         except Exception as e:
-            logger.exception("Error in provision_loop " + str(e))
+            logger.exception("Error in poll_provision_loop " + str(e))
             time.sleep(60)
 
-def provision_trigger_loop():
+def poll_trigger_loop():
     """
     Periodically release the provision_start_release lock to trigger
     scheduled provisioning.
     """
+    poll_interval_s = time_to_sec(poll_interval)
     while True:
         try:
             logger.debug("Provision start release trigger")
-            signal_provision_start()
-            time.sleep(10)
+            polling_release()
+            time.sleep(poll_interval_s)
         except Exception as e:
-            logger.exception("Error in provision_trigger_loop " + str(e))
+            logger.exception("Error in poll_trigger_loop " + str(e))
             time.sleep(60)
 
-def add_config(name):
-    if name not in provision_configs:
-        provision_configs[name] = ProvisionConfig(name)
-        stat_config_state.labels(name).state('unknown')
+def set_config(config_map):
+    name = config_map.metadata.name
+    config = provision_configs.get(name, None)
+    if config:
+        config.handle_config_map_update(config_map)
+    else:
+        provision_configs[name] = ProvisionConfig(config_map)
 
-def remove_config(name):
-    config_queue.remove(name)
-    if name in provision_configs:
-        stat_config_state.labels(name).state('removed')
-        del provision_configs[name]
+def remove_config(config_map):
+    config = provision_configs.get(config_map.metadata.name, None)
+    if config:
+        config.handle_config_map_removed()
 
 def watch_config_maps():
     w = kubernetes.watch.Watch()
@@ -741,12 +705,11 @@ def watch_config_maps():
             event['type'],
             config_map.metadata.name
         ))
-        if event['type'] in ('ADDED','MODIFIED'):
-            if config_map.metadata.deletion_timestamp:
-                remove_config(config_map.metadata.name)
-            else:
-                add_config(config_map.metadata.name)
-                config_queue.push(config_map.metadata.name)
+        if event['type'] in ('ADDED','MODIFIED') \
+        and not config_map.metadata.deletion_timestamp:
+            set_config(config_map)
+        elif event_type == 'DELETED':
+            remove_config(config_map)
 
 def watch_config_maps_loop():
     while True:
@@ -757,18 +720,6 @@ def watch_config_maps_loop():
             logger.exception("Error in watch_config_maps " + str(e))
             time.sleep(60)
 
-def delete_runner_pod(pod_name):
-    logger.debug('Deleting pod ' + pod_name)
-    try:
-        kube_api.delete_namespaced_pod(
-            pod_name,
-            namespace,
-            {}
-        )
-    except kubernetes.client.rest.ApiException as e:
-        if e.status != 404:
-            raise
-
 def watch_pods():
     logger.debug('Starting watch for runner pods')
     w = kubernetes.watch.Watch()
@@ -778,12 +729,23 @@ def watch_pods():
         label_selector = 'openshift-provision.gnuthought.com/runner=true'
     ):
         pod = event['object']
-        logger.debug("Watch saw {} pod {}".format(
-            event['type'],
-            pod.metadata.name
-        ))
-        if event['type'] in ('ADDED','MODIFIED'):
-            handle_runner_pod(pod)
+        config_name = pod.metadata.labels.get(
+            'openshift-provision.gnuthought.com/configmap',
+            None
+        )
+        if config_name == None:
+            logger.warn("Deleting runner pod {} without configmap label".format(
+                pod.metadata.name
+            ))
+            delete_pod(pod.metadata.name)
+        elif config_name not in provision_configs:
+            logger.warn("Deleting runner pod {} with unknown configmap: {}".format(
+                pod.metadata.name,
+                config_name
+            ))
+            delete_pod(pod.metadata.name)
+        else:
+            provision_configs[config_name].handle_runner_pod_event(event['type'], pod)
 
 def pod_management_loop():
     while True:
@@ -806,10 +768,9 @@ def api_provision(name, key):
         logger.warn("Invalid webhook key for {}".format(name))
         flask.abort(403)
         return
-    stat_webhook_call_count.labels(name).inc()
-    config.set_next_time_no_check_mode()
-    config_queue.push(name)
-    return flask.jsonify({'status': 'queued'})
+    config.webhook_triggered(True)
+    polling_release()
+    return flask.jsonify({'status': 'ok'})
 
 @api.route('/check/<string:name>/<string:key>', methods=['POST'])
 def api_check(name, key):
@@ -823,9 +784,9 @@ def api_check(name, key):
         logger.warn("Invalid webhook key for {}".format(name))
         flask.abort(403)
         return
-    stat_webhook_call_count.labels(name).inc()
-    config_queue.push(name)
-    return flask.jsonify({'status': 'queued'})
+    config.webhook_triggered(False)
+    polling_release()
+    return flask.jsonify({'status': 'ok'})
 
 @api.route('/callback/<string:name>/<string:key>', methods=['POST'])
 def api_callback(name, key):
@@ -835,11 +796,11 @@ def api_callback(name, key):
         flask.abort(404)
         return
     config = provision_configs[name]
-    if key != config.callback_key():
+    if key != config.callback_key:
         logger.warn("Invalid callback key for {}".format(name))
         flask.abort(403)
         return
-    provision_configs[name].handle_run_result(flask.request.data)
+    provision_configs[name].handle_callback_data(flask.request.data)
     return flask.jsonify({'status': 'ok'})
 
 def main():
@@ -847,15 +808,15 @@ def main():
     init()
     threading.Thread(
         name = 'Provision',
-        target = provision_loop
-    ).start()
-    threading.Thread(
-        name = 'Watch',
-        target = watch_config_maps_loop
+        target = poll_provision_loop
     ).start()
     threading.Thread(
         name = 'Trigger',
-        target = provision_trigger_loop
+        target = poll_trigger_loop
+    ).start()
+    threading.Thread(
+        name = 'WatchConfig',
+        target = watch_config_maps_loop
     ).start()
     threading.Thread(
         name = 'PodManager',
