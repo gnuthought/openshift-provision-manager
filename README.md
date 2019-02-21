@@ -16,7 +16,7 @@ role, this containerized deployment adds:
 * **Pushable** - configmaps are processed immediately and webhooks are
   available for version control triggers
 
-* **Pollable** - resources are periodically checked for configuration
+* **Polling** - resources are periodically checked for configuration
   divergence and configurable convergence
 
 * **Immediate** - responsive to changes in managed resources (feature in
