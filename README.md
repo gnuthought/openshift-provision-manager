@@ -32,5 +32,7 @@ If installing an a non-administrator:
 ```
 NAMESPACE=example-provisioner
 oc new-project $NAMESPACE
-oc process -p OPENSHIFT_PROVISION_NAMESPACE=$NAMESPACE -f install-template-nonadmin.yaml | oc create -f -
+oc process -f install-template-nonadmin.yaml \
+ -p OPENSHIFT_PROVISION_NAMESPACE=$NAMESPACE \
+| oc create -f -
 ```
