@@ -3,6 +3,25 @@
 Containerized cluster self-management using the
 [openshift-provision](https://github.com/gnuthought/ansible-role-openshift-provision) ansible role.
 
+## Project Goals
+
+In addition to the project goals of the underlying openshift-provision Ansible
+role, this containerized deployment adds:
+
+* **Usable** - without requiring cluster admin access, no custom resource
+  definitions required.
+
+* **Versioned** - integrated with git version control
+
+* **Pushable** - configmaps are processed immediately and webhooks are
+  available for version control triggers
+
+* **Pollable** - resources are periodically checked for configuration
+  divergence and configurable convergence
+
+* **Immediate** - responsive to changes in managed resources (feature in
+  project resources)
+
 ## Examples
 
 In order of increasing complexity:
