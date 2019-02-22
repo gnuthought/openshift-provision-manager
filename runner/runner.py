@@ -90,7 +90,9 @@ def prepare_ansible_dir():
         'openshift_provision_change_record':
             change_record,
         'openshift_provision_manager_namespace':
-            namespace
+            namespace,
+        'openshift_provision_project_dir':
+            run_dir + '/project'
     })
 
     if os.environ.get('CONFIG_PATH', '') != '':
