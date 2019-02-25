@@ -41,13 +41,13 @@ to manage resources in target namespaces.
 In order of increasing complexity:
 
 All-in-one declarative resource management:
-[openshift-provision](https://github.com/gnuthought/openshift-provision-example-0)
+[openshift-provision-example-0](https://github.com/gnuthought/openshift-provision-example-0)
 
 Add using git clone to keep in sync with a repository:
-[openshift-provision](https://github.com/gnuthought/openshift-provision-example-1)
+[openshift-provision-example-1](https://github.com/gnuthought/openshift-provision-example-1)
 
 Add using OpenShift templates to simplify managing multiple similar resources:
-[openshift-provision](https://github.com/gnuthought/openshift-provision-example-2)
+[openshift-provision-example-2](https://github.com/gnuthought/openshift-provision-example-2)
 
 Each template includes installation templates used in a similar manner as
 described below.
