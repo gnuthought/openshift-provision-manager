@@ -496,7 +496,7 @@ class ProvisionConfig:
         set by config change or trigger.
         '''
         if self.next_run_state:
-            self._set_run_state(next_run_state)
+            self._set_run_state(self.next_run_state)
             self.next_run_state = None
         elif run_state:
             self._set_run_state(run_state)
