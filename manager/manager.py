@@ -72,7 +72,7 @@ default_retry_interval = os.environ.get('RETRY_INTERVAL', '10m')
 default_run_interval = os.environ.get('RUN_INTERVAL', '30m')
 
 # Delay for next run after succesful run
-default_run_timeout = os.environ.get('RUN_TIMEOUT', '30m')
+default_run_timeout = os.environ.get('RUN_TIMEOUT', '10m')
 
 # Global list of known provision configurations
 provision_configs = {}
