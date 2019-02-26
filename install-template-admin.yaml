@@ -175,6 +175,16 @@ objects:
         terminationGracePeriodSeconds: 30
 
 - apiVersion: authorization.openshift.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: openshift-provision-self-provisioner
+  roleRef:
+    name: self-provisioner
+  subjects:
+  - kind: SystemGroup
+    name: system:serviceaccounts:${OPENSHIFT_PROVISION_NAMESPACE}
+
+- apiVersion: authorization.openshift.io/v1
   kind: ClusterRole
   metadata:
     annotations:
