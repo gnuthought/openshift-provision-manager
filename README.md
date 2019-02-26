@@ -60,13 +60,14 @@ As a cluster administrator:
 oc process -f install-template-admin.yaml | oc create -f -
 ```
 
-If installing an a non-administrator:
+If installing as a non-administrator you will need to pre-create a namespace
+for the openshift-provision-manager:
 
 ```
-NAMESPACE=example-provisioner
-oc new-project $NAMESPACE
+PROVISIONER_NAMESPACE=example-provisioner
+oc new-project $PROVISIONER_NAMESPACE
 oc process -f install-template-nonadmin.yaml \
- -p OPENSHIFT_PROVISION_NAMESPACE=$NAMESPACE \
+ -p OPENSHIFT_PROVISION_NAMESPACE=$PROVISIONER_NAMESPACE \
 | oc create -f -
 ```
 
