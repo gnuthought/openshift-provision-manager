@@ -16,9 +16,12 @@ nss_wrapper_passwd = run_dir + '/passwd'
 logger = None
 
 process_env = {
+    'ANSIBLE_LOCAL_TEMP': run_dir + '/.ansible/tmp',
+    'ANSIBLE_REMOTE_TEMP': run_dir + '/.ansible/tmp',
     'HOME': run_dir,
     'LD_PRELOAD': 'libnss_wrapper.so',
-    'NSS_WRAPPER_PASSWD': nss_wrapper_passwd
+    'NSS_WRAPPER_PASSWD': nss_wrapper_passwd,
+    'NSS_WRAPPER_GROUP': '/etc/group'
 }
 
 openshift_provision_playbook = os.environ.get(
@@ -197,8 +200,9 @@ def init():
     check_env()
 
 def init_nss_wrapper_passwd():
-    fh = open(nss_wrapper_passwd, 'w')
-    fh.write("ansible:x:{}:0:ansible:{}:/bin/bash".format(
+    shutil.copyfile('/etc/passwd', nss_wrapper_passwd)
+    fh = open(nss_wrapper_passwd, 'a')
+    fh.write("ansible:x:{}:0:ansible:{}:/bin/bash\n".format(
         os.geteuid(),
         run_dir
     ))
