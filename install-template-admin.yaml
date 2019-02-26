@@ -9,6 +9,8 @@ metadata:
 parameters:
 - name: OPENSHIFT_PROVISION_NAMESPACE
   value: openshift-provision
+- name: OPENSHIFT_PROVISION_IMAGESTREAM_NAMESPACE
+  value: openshift
 - name: MANAGER_DEPLOYMENT_NAME
   value: manager
 - name: MANAGER_SERVICE_NAME
@@ -93,7 +95,7 @@ objects:
     annotations:
       openshift.io/display-name: openshift-provision-manager
     name: openshift-provision-manager
-    namespace: openshift
+    namespace: ${OPENSHIFT_PROVISION_IMAGESTREAM_NAMESPACE}
   spec:
     lookupPolicy:
       local: false
@@ -117,7 +119,7 @@ objects:
     annotations:
       openshift.io/display-name: openshift-provision-runner
     name: openshift-provision-runner
-    namespace: openshift
+    namespace: ${OPENSHIFT_PROVISION_IMAGESTREAM_NAMESPACE}
   spec:
     lookupPolicy:
       local: false
@@ -158,8 +160,8 @@ objects:
         - name: manager
           env:
           - name: RUNNER_IMAGE
-            value: docker-registry.default.svc:5000/openshift/openshift-provision-runner:latest
-          image: docker-registry.default.svc:5000/openshift/openshift-provision-manager:latest
+            value: docker-registry.default.svc:5000/${OPENSHIFT_PROVISION_IMAGESTREAM_NAMESPACE}/openshift-provision-runner:latest
+          image: docker-registry.default.svc:5000/${OPENSHIFT_PROVISION_IMAGESTREAM_NAMESPACE}/openshift-provision-manager:latest
           imagePullPolicy: Always
           # FIXME - Add probes
           #livenessProbe:
