@@ -199,11 +199,15 @@ class ProvisionConfig:
     def _set_state_transition(self, run_state=None, config_state=None):
         '''Set next state or immediate state as appropriate'''
         if self.run_state in ('running', 'received-callback'):
-            self.next_config_state = config_state
-            self.next_run_state = run_state
+            if config_state:
+                self.next_config_state = config_state
+            if run_state:
+                self.next_run_state = run_state
         else:
-            self._set_config_state(config_state)
-            self._set_run_state(run_state)
+            if config_state:
+                self._set_config_state(config_state)
+            if run_state:
+                self._set_run_state(run_state)
 
     def _set_next_start_time(self):
         if self.run_state in ('triggered'):
