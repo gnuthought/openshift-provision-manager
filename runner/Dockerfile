@@ -21,7 +21,7 @@ RUN yum install -y \
 
 RUN easy_install pip && \
     pip install --ignore-installed \
-      ansible \
+      ansible==2.6.14 \
       requests \
     && \
     git clone --branch=master --single-branch \
