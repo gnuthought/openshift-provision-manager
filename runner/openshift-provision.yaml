@@ -4,7 +4,7 @@
   connection: local
   gather_facts: false
 
-  pre_tasks:
+  tasks:
 
   - name: Show openshift_provision_config_path
     debug:
@@ -41,5 +41,6 @@
         }}
     when: openshift_provision_resource_path is not defined
 
-  roles:
-  - role: openshift-provision
+  - name: Include openshift-provision role
+    include_role:
+      name: openshift-provision
