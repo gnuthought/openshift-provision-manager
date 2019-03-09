@@ -1,5 +1,6 @@
 FROM centos:7
 ARG OPENSHIFT_PROVISION_REPO=https://github.com/gnuthought/ansible-role-openshift-provision
+ARG HELM_URL=https://storage.googleapis.com/kubernetes-helm/helm-v2.13.0-linux-amd64.tar.gz
 
 USER 0
 
@@ -24,6 +25,8 @@ RUN easy_install pip && \
       ansible==2.6.14 \
       requests \
     && \
+    curl -o helm.tgz $HELM_URL && \
+    tar xvf helm.tgz --strip=1 --directory=/usr/bin */helm && \
     git clone --branch=master --single-branch \
       ${OPENSHIFT_PROVISION_REPO} /etc/ansible/roles/openshift-provision
 
