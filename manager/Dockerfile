@@ -11,7 +11,9 @@ RUN yum install -y \
       python \
       python-devel \
       python-jmespath \
-      python-setuptools && \
+      python-setuptools \
+    && \
+    yum upgrade -y && \
     yum clean all && \
     useradd -u 1000 ansible
 

@@ -17,6 +17,7 @@ RUN yum install -y \
       nss_wrapper \
       origin-clients \
     && \
+    yum upgrade -y && \
     yum clean all && \
     useradd -u 1000 ansible
 
